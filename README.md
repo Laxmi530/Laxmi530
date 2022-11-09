@@ -2,7 +2,7 @@
 - 👀 I’m interested in writing code.
 - 🌱 I’m currently learning AI, ML, Data science and computer vision
 - 💞️ I’m looking to collaborate on AI, ML projects...
-- 📫 How to reach me ... mail me @ laxmidhar530@outlook.com
+- 📫 How to reach me ...
 
 <!---
 Laxmi530/Laxmi530 is a ✨ special ✨ repository because its `README.md` (this file) appears on your GitHub profile.
