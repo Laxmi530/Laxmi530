@@ -9,1213 +9,691 @@
   
 ```
 """
-Value-at-Risk estimation and **VaR backtesting**.
+Vol-LSTM: deep-learning **volatility** forecasting with a conformalized cone.
 
-Motivated by *Hands-On Deep Learning for Finance* (Troiano et al.), Chapter 9,
-"Risk Measurement Using GAN" — whose opening sections are "Estimating value at
-risk" and "Computing methods and drawbacks", and whose closing section is
-"Benchmarking results". This module implements that arc: the classical VaR
-estimators, their documented drawbacks, a robust alternative, a generative
-sampler in the spirit of the chapter, and — critically — the **statistical tests
-that decide whether a VaR number was actually right**.
+Motivated by *Hands-On Deep Learning for Finance* (Troiano et al.), Chapter 5,
+"Volatility Forecasting by LSTM" — the chapter that builds an LSTM on realized
+volatility, improves it with stacked layers and online learning, and then
+benchmarks it against a plain RNN and a **GARCH** model using the cumulative
+squared error.
 
-The gap this fills
-------------------
-The app already *reports* risk: ``risk_metrics.empirical_risk`` reads a 5% VaR
-and expected shortfall off HAR-RV's conformal residuals. But nothing in the
-project ever **validated a VaR number**. Interval coverage is checked for the
-two-sided 95% cone, which is a different question from "does the 5% left tail
-break exactly 5% of the time, and are the breaks independent?" A VaR model can
-have perfect unconditional coverage and still be useless because all its
-exceptions arrive in one cluster — precisely the failure that matters, since
-clustered breaches are what actually bankrupt a position.
+Why this model belongs here
+---------------------------
+The project's own walk-forward evidence (README "Empirical findings") is blunt:
+at single-name daily/hourly horizons the **first moment is a random walk** — no
+feature set, tree, or network beat it in a data-snooping-robust test (White's
+Reality Check p = 0.90). The **second moment** is different: volatility clusters
+and is genuinely forecastable, which is why HAR-RV and the GARCH layer earn
+their place. So the useful place to spend a neural network here is on
+*variance*, not on direction.
 
-So the deliverable here is two-sided:
+This model is therefore the deep-learning **counterpart to HAR-RV**, and the
+comparison the book runs (LSTM vs GARCH) is exactly the comparison this codebase
+was missing:
 
-* **Estimators** — parametric (variance-covariance), historical simulation,
-  Cornish-Fisher (skew/kurtosis-adjusted), Filtered Historical Simulation, and
-  an optional generative sampler.
-* **Backtests** — Kupiec's proportion-of-failures test (unconditional coverage),
-  Christoffersen's independence test (are breaches clustered?), and their joint
-  conditional-coverage test, plus a rolling out-of-sample harness and a
-  method comparison table.
+* **HAR-RV** explains today's log-variance with three *linear* lags (day, week,
+  month) — four OLS parameters, extremely hard to beat, but strictly linear and
+  strictly additive in those three horizons.
+* **Vol-LSTM** reads a whole look-back window of log-RV (plus the HAR averages
+  and the signed-return channel) through stacked LSTM layers, so it can learn
+  *non-linear* and *asymmetric* variance dynamics — notably the leverage effect
+  (down-moves raise tomorrow's variance more than equal up-moves), which the
+  symmetric HAR regression cannot express and which GJR/EGARCH only capture with
+  a hand-specified term.
 
-Sign convention
----------------
-Every VaR function returns ``var_return``: the **return threshold**, so it is
-**negative** for a loss (e.g. ``-0.031`` = "we expect to lose more than 3.1% on
-5% of days"). This matches ``risk_metrics.var5_pct``, which is also a negative
-fraction, so the two are directly comparable. ``var_loss`` is the same figure as
-a positive magnitude for display.
+Contract and honesty
+--------------------
+Like HAR-RV, this model makes **no directional claim**: the point path is the
+random walk (last price held flat), and the deliverable is the **calibrated
+uncertainty cone**. That keeps it directly A/B-able against HAR-RV on the metric
+that matters — interval coverage and sharpness — without smuggling in a
+first-moment claim the evidence does not support.
 
-Dependencies: numpy / pandas only. The optional generative sampler imports
-TensorFlow lazily and degrades to a block bootstrap when it is unavailable or
-fails to train — it can never break a caller.
+The cone is built the same way as HAR-RV's, so the two are like-for-like:
+
+1. Forecast per-step log realized variance for h = 1..horizon **directly**
+   (one output per step, no recursive feedback — the same fix applied to the
+   price models in ``forecast_nn_direct``).
+2. Exponentiate with a **data-estimated level offset** so the variance forecast
+   is unbiased (``log(r^2)`` sits ~1.27 nats below ``log(sigma^2)`` for Gaussian
+   returns — see the note in ``_forecast_cone``), then cumulate (variance is
+   additive across steps) to get sigma to each h.
+3. Calibrate a **per-horizon conformal multiplier** from the standardized
+   cumulative residuals on a held-out recent block, optionally refined by
+   **Adaptive Conformal Inference** so the cone responds to a regime shift.
+4. Wrap the flat path in ``last_price * exp(±k_h * sigma_h)``.
+
+Because steps 3-4 reuse ``HAR_RV_model``'s ACI machinery, any improvement there
+lands in both models, and the signed residuals are exported as
+``attrs['risk_log_returns']`` so the app's risk panel reads fat-tailed empirical
+probabilities off this model too.
 """
 
-import math
+import os
+import warnings
 
 import numpy as np
 import pandas as pd
 
-# RiskMetrics decay for the EWMA variance filter. 0.94 is the standard daily
-# value; it puts a ~1-month effective half-life on the variance estimate.
-EWMA_LAMBDA = 0.94
-_N_SIMS = 20000
-_EPS = 1e-12
+from model_utils import (
+    normalize_interval,
+    coerce_numeric_columns,
+    generate_future_dates,
+    reset_keras_seeds,
+    temporal_train_val_split,
+    default_keras_callbacks,
+)
+from HAR_RV_model import (
+    _har_lags,
+    _aci_multipliers,
+    _asymmetric_multipliers,
+    _fallback_variance,
+    _realized_semivariance,
+    _Z95,
+    _EPS,
+)
+
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# Look-back window of RV bars fed to the LSTM. 60 daily bars (~3 months) covers
+# the monthly HAR lag with room for the network to find longer structure; hourly
+# uses 70 (= 10 NSE sessions of 7 bars).
+_LOOK_BACK = {'daily': 60, 'hourly': 70}
+# Recent fraction held out to conformalize the cone (never trained on).
+_CAL_FRAC = 0.25
+_MIN_CAL = 20
+
+#: Guard on the served cone (README section 83). On some histories the network's
+#: per-step variance swings far from anything realised, the conformal layer then
+#: calibrates against that spread, and the band explodes (572% at five sessions
+#: for HDFCBANK from 2021-01-01; 91 million percent at 13). When the forecast
+#: leaves this range the cone falls back to the EWMA variance with the normal
+#: multiplier, the same path as a short history: any per-step sd above
+#: _GUARD_RATIO times, or below 1/_GUARD_RATIO of, the sd of the last
+#: _GUARD_WINDOW returns; any conformal multiplier above _GUARD_K (normal 1.96);
+#: or anything non-finite. Set before the effect was measured.
+_GUARD_RATIO = 4.0
+_GUARD_K = 6.0
+_GUARD_WINDOW = 60
+# Rows needed before the LSTM path is viable at all; below this we fall back to
+# the EWMA cone rather than fitting a network on a handful of samples.
+_MIN_ROWS = 260
 
 
 # ==========================================
-# Small distribution helpers (no SciPy)
+# 1. Realized-variance feature channels
 # ==========================================
-def _norm_ppf(p):
+def build_rv_channels(returns, lags):
     """
-    Standard-normal inverse CDF via ``statistics.NormalDist``.
+    Build the per-bar input channels for the volatility network.
 
-    Kept local so this module has no SciPy dependency (``backtest.py`` already
-    treats SciPy as optional, and the rest of the project follows suit).
-    """
-    from statistics import NormalDist
-    return float(NormalDist().inv_cdf(min(max(p, 1e-12), 1 - 1e-12)))
+    Five channels, all strictly causal (each value at index ``k`` uses only bars
+    up to and including ``k``):
 
-
-def _norm_pdf(x):
-    """Standard-normal density."""
-    return float(math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi))
-
-
-def _norm_cdf(x):
-    """Standard-normal CDF via the error function."""
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-
-def _tail_es(log_samples, q):
-    """
-    Expected shortfall as a SIMPLE return, from log-return samples.
-
-    ``es_return`` is reported on the same scale as ``var_return`` and as the
-    realised returns the ES backtest scores it against: simple returns. For
-    the VaR that is free, because a quantile commutes with ``expm1``. A MEAN
-    does not. By Jensen's inequality ``expm1(mean(x)) <= mean(expm1(x))``, so
-    converting the mean log tail overstates the average loss, more so the more
-    dispersed the tail is (Sadr, *Mathematical Techniques in Finance*, A.2.4).
-    The average of the tail's simple returns is the quantity the label claims.
-    """
-    tail = log_samples[log_samples <= q]
-    return float(np.mean(np.expm1(tail))) if len(tail) else float(math.expm1(q))
-
-
-def _gaussian_es_gross(mu, sigma, alpha):
-    """E[exp(X) | X <= q_alpha] for X ~ N(mu, sigma^2): the lognormal tail mean."""
-    z = _norm_ppf(alpha)
-    return math.exp(mu + 0.5 * sigma * sigma) * _norm_cdf(z - sigma) / alpha
-
-
-def _chi2_sf(x, df):
-    """
-    Upper-tail probability of a chi-squared variate, for df in {1, 2}.
-
-    Closed forms only — those are the two degrees of freedom the Kupiec and
-    Christoffersen tests need, so a general incomplete-gamma implementation
-    would be dead weight.
-
-    * df = 1: ``P(X > x) = erfc(sqrt(x / 2))``
-    * df = 2: ``P(X > x) = exp(-x / 2)``
-    """
-    if not np.isfinite(x) or x < 0:
-        return float('nan')
-    if df == 1:
-        return float(math.erfc(math.sqrt(x / 2.0)))
-    if df == 2:
-        return float(math.exp(-x / 2.0))
-    raise ValueError("only df=1 and df=2 are supported")
-
-
-# ==========================================
-# Volatility filter
-# ==========================================
-def ewma_volatility(returns, lam=EWMA_LAMBDA, warmup=20):
-    """
-    One-step-ahead EWMA conditional volatility for each bar.
-
-    ``sigma2[t] = lam * sigma2[t-1] + (1 - lam) * r[t-1]^2``, so ``sigma[t]``
-    uses only bars strictly before ``t`` — it is a genuine forecast, not a
-    contemporaneous fit, which is what makes the standardized residuals below
-    usable for out-of-sample work.
+    0. ``log_rv``        — log realized variance of the bar (``log(r^2)``), the
+       target's own history and the single most informative input.
+    1. ``log_rv_med``    — trailing mean of ``log_rv`` over the medium (weekly)
+       window. Handing the network the HAR averages explicitly means it starts
+       from HAR's information set instead of having to rediscover it from raw
+       lags — a small, cheap inductive bias that matters a lot on ~1000 rows.
+    2. ``log_rv_long``   — trailing mean over the long (monthly) window.
+    3. ``signed``        — ``sign(r) * sqrt(RV)`` = the signed return itself. This
+       is the channel HAR structurally cannot use: it lets the network learn the
+       **leverage effect** (a −3% day implies more future variance than a +3%
+       day), which is otherwise only available via a hand-coded GJR/EGARCH term.
+    4. ``down_share``    — the bar's downside share of variance
+       (``1`` if the return was negative, else ``0``, smoothed over the medium
+       window) — Patton & Sheppard's "bad volatility", the empirically
+       higher-signal half of realized variance.
 
     Parameters
     ----------
     returns : array-like
         Per-bar log returns.
-    lam : float, optional
-        Decay factor. Default 0.94 (RiskMetrics daily).
-    warmup : int, optional
-        Bars used to seed the variance from a sample estimate. Default 20.
+    lags : tuple of int
+        (short, medium, long) HAR memory windows in bars.
+
+    Returns
+    -------
+    (np.ndarray, np.ndarray)
+        ``(channels, log_rv)`` where ``channels`` has shape (n_bars, 5) and
+        ``log_rv`` is the 1-D target series (both aligned to ``returns``).
+    """
+    r = np.asarray(returns, dtype=np.float64)
+    _, med, long = lags
+
+    rv = r ** 2
+    log_rv = np.log(rv + _EPS)
+    # Clip the log-RV tails: a single near-zero return produces a hugely negative
+    # log value that would dominate a squared-error fit.
+    lo, hi = np.percentile(log_rv, [1, 99])
+    log_rv = np.clip(log_rv, lo, hi)
+
+    s = pd.Series(log_rv)
+    ch_med = s.rolling(med, min_periods=1).mean().values
+    ch_long = s.rolling(long, min_periods=1).mean().values
+
+    rs_down, _ = _realized_semivariance(r)
+    down_flag = (rs_down > 0).astype(np.float64)
+    ch_down = pd.Series(down_flag).rolling(med, min_periods=1).mean().values
+
+    signed = np.sign(r) * np.sqrt(np.maximum(rv, 0.0))
+
+    channels = np.column_stack([log_rv, ch_med, ch_long, signed, ch_down])
+    return channels.astype(np.float64), log_rv
+
+
+# ==========================================
+# 2. Network
+# ==========================================
+def build_vol_lstm(input_shape, output_dim, units=None, dropout=None):
+    """
+    Stacked LSTM regressor for direct multi-horizon log-variance forecasting.
+
+    Two recurrent layers (the book's "stacking layers" improvement) with output
+    and recurrent dropout, a small dense bottleneck, and ``output_dim`` linear
+    outputs — one per horizon step, so no prediction is ever fed back and the
+    h-step error is not an accumulation of 1-step errors.
+
+    Capacity is intentionally modest (48/24 units). Volatility series are short
+    (~1000 bars here) and smooth; the project already learned from N-BEATS that
+    an over-parameterised network on ~700 rows produces spectacular
+    out-of-sample failures. Huber loss keeps the fit from chasing the residual
+    log-RV outliers that survive clipping.
+
+    Parameters
+    ----------
+    input_shape : tuple of int
+        (look_back, n_channels).
+    output_dim : int
+        Number of horizon steps to predict.
+    units : tuple of int, optional
+        Hidden sizes of the two LSTM layers. Default (48, 24).
+    dropout : float, optional
+        Output dropout rate. Default 0.2.
+
+    Returns
+    -------
+    tf.keras.Model
+        Compiled model.
+    """
+    import tensorflow as tf
+    from tensorflow.keras import layers, Model, Input
+
+    # Defaults from architectures.SPECS; explicit arguments still win.
+    import architectures as arch
+    _sp = arch.spec('Vol-LSTM')
+    units = tuple(units if units is not None else _sp.get('units', (48, 24)))
+    dropout = float(dropout if dropout is not None else _sp.get('dropout', 0.2))
+
+    inputs = Input(shape=input_shape)
+    x = layers.LSTM(units[0], return_sequences=True, recurrent_dropout=0.1)(inputs)
+    x = layers.Dropout(dropout)(x)
+    x = layers.LSTM(units[1], return_sequences=False, recurrent_dropout=0.1)(x)
+    x = layers.Dropout(dropout)(x)
+    x = layers.Dense(16, activation='relu')(x)
+    outputs = layers.Dense(output_dim)(x)
+
+    model = Model(inputs, outputs)
+    model.compile(
+        loss='huber',
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3, clipnorm=1.0),
+    )
+    return model
+
+
+def train_vol_lstm(X, Y, epochs=120, batch_size=32, online_epochs=0):
+    """
+    Fit the volatility LSTM with an embargoed temporal validation split.
+
+    Uses ``temporal_train_val_split``, which purges a gap equal to the number of
+    target columns between train and validation — necessary here because each
+    label spans ``horizon`` future bars, so without the embargo the last training
+    labels and the first validation labels would share future bars and make
+    early stopping look better than it is.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        (n_samples, look_back, n_channels) input windows.
+    Y : np.ndarray
+        (n_samples, horizon) per-step log-variance targets.
+    epochs : int, optional
+        Maximum epochs (early stopping usually fires well before). Default 120.
+    batch_size : int, optional
+        Mini-batch size. Default 32.
+    online_epochs : int, optional
+        The book's **online learning** refinement: after the main fit, run this
+        many extra low-learning-rate epochs on only the most recent 20% of
+        samples, so the network is nudged toward the current volatility regime.
+        Default 0 (off) — it is a recency bias that helps in a regime shift and
+        hurts in a calm stretch, so it ships as an explicit opt-in rather than a
+        silent default.
+
+    Returns
+    -------
+    tf.keras.Model
+        Trained model.
+    """
+    import tensorflow as tf
+
+    reset_keras_seeds()
+    X_train, X_val, Y_train, Y_val = temporal_train_val_split(X, Y)
+
+    print(f"Building Vol-LSTM ({X.shape[1]} steps x {X.shape[2]} channels "
+          f"-> {Y.shape[1]} horizons)...")
+    model = build_vol_lstm(X.shape[1:], Y.shape[1])
+
+    model.fit(
+        X_train, Y_train,
+        validation_data=(X_val, Y_val),
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=default_keras_callbacks(),
+        shuffle=True,
+        verbose=0,
+    )
+
+    if online_epochs > 0 and len(X_train) > 40:
+        tail = max(20, int(len(X_train) * 0.2))
+        model.optimizer.learning_rate.assign(1e-4)
+        print(f"  online fine-tune: {online_epochs} epochs on the last {tail} samples")
+        model.fit(X_train[-tail:], Y_train[-tail:], epochs=online_epochs,
+                  batch_size=16, shuffle=False, verbose=0)
+
+    return model
+
+
+# ==========================================
+# 3. Dataset assembly
+# ==========================================
+def _make_samples(channels, log_rv, look_back, horizon, origins):
+    """
+    Assemble (window, per-step-log-RV-target) pairs for the given RV origins.
+
+    An origin ``o`` means "the last observed RV bar is index ``o``": the input is
+    ``channels[o - look_back + 1 : o + 1]`` and the target is
+    ``log_rv[o + 1 : o + horizon + 1]``. Keeping this in one helper guarantees
+    the training, calibration and serving paths index identically — the class of
+    off-by-one that silently corrupts multi-horizon models.
+    """
+    X = np.stack([channels[o - look_back + 1:o + 1] for o in origins])
+    Y = np.stack([log_rv[o + 1:o + horizon + 1] for o in origins])
+    return X, Y
+
+
+def _standardize(train_block):
+    """Per-channel mean/std from the training block only (no lookahead)."""
+    mu = train_block.reshape(-1, train_block.shape[-1]).mean(axis=0)
+    sd = train_block.reshape(-1, train_block.shape[-1]).std(axis=0)
+    sd = np.where(sd < 1e-8, 1.0, sd)
+    return mu, sd
+
+
+# ==========================================
+# 4. Main orchestrator
+# ==========================================
+def run_vol_lstm_prediction(df, interval, horizon, adaptive=True, aci_gamma=0.05,
+                            asymmetric=False, online_epochs=0):
+    """
+    Forecast a volatility cone with a stacked LSTM; point path is the random walk.
+
+    Mirrors ``HAR_RV_model.run_har_rv_prediction``'s contract exactly (same
+    output columns, same flat point forecast, same conformal + ACI cone
+    machinery) so the two can be A/B-ed on coverage and sharpness as a
+    like-for-like linear-vs-deep comparison — the book's LSTM-vs-GARCH experiment
+    transplanted onto this project's realized-variance setup.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Raw stock DataFrame with 'datetime' and 'adj_close'.
+    interval : str
+        '1d' / 'daily' / '1 Day' or '1h' / 'hourly' / '1 Hour'.
+    horizon : int
+        Number of future steps to forecast.
+    adaptive : bool, optional
+        Refine the per-horizon conformal multiplier with Adaptive Conformal
+        Inference so the cone tracks a recent volatility regime shift rather
+        than the long-run calibration average. Default True (as in HAR-RV).
+    aci_gamma : float, optional
+        ACI learning rate. Default 0.05.
+    asymmetric : bool, optional
+        Build separate lower/upper cone edges from the signed residuals, so a
+        fatter loss tail widens the downside. Default False — the same A/B that
+        turned this off for HAR-RV applies (per-side calibration is noisier on
+        near-symmetric residuals).
+    online_epochs : int, optional
+        Book Ch. 5 online-learning fine-tune epochs on the most recent samples.
+        Default 0 (off).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns ['datetime', 'predicted_price', 'lower_bound', 'upper_bound',
+        'volatility']. ``attrs`` carries ``risk_log_returns`` (the empirical,
+        fat-tailed horizon-end return sample the risk panel reads),
+        ``downside_share``, and ``vol_model`` diagnostics.
+    """
+    interval = normalize_interval(interval)
+    print(f"--- Starting Vol-LSTM (volatility) Prediction ({interval}) ---")
+
+    df = df.copy()
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df = df.set_index('datetime').sort_index()
+    coerce_numeric_columns(df)
+
+    max_obs = 1500 if interval == 'daily' else 1000
+    prices = df['adj_close'].dropna().values.astype(np.float64)
+    prices = prices[prices > 0]
+    if len(prices) > max_obs:
+        prices = prices[-max_obs:]
+
+    last_price = float(prices[-1])
+    last_date = df.index[-1]
+    future_dates = generate_future_dates(last_date, horizon, interval)
+
+    returns = np.diff(np.log(prices))
+    lags = _har_lags(interval)
+    look_back = _LOOK_BACK[interval]
+
+    step_var, mult, signed_resid, diag = _forecast_cone(
+        prices, returns, lags, look_back, horizon, adaptive, aci_gamma,
+        online_epochs,
+    )
+
+    # Asymmetric edges (optional): per-side multipliers from the signed residuals.
+    k_lo = k_up = None
+    if asymmetric and signed_resid:
+        k_lo, k_up = _asymmetric_multipliers(
+            signed_resid, horizon, adaptive=adaptive, gamma=aci_gamma)
+
+    # Variance is additive across (assumed-uncorrelated) steps.
+    cum_sigma = np.sqrt(np.cumsum(step_var))
+
+    rows = []
+    for i in range(horizon):
+        sig = float(cum_sigma[i])
+        kl, ku = ((float(k_lo[i]), float(k_up[i])) if k_lo is not None
+                  else (float(mult[i]), float(mult[i])))
+        rows.append({
+            'datetime': future_dates[i],
+            'predicted_price': last_price,                       # random walk
+            'lower_bound': float(last_price * np.exp(-kl * sig)),
+            'upper_bound': float(last_price * np.exp(ku * sig)),
+            'volatility': float(np.sqrt(step_var[i])),           # per-step vol
+        })
+
+    out = pd.DataFrame(rows)
+
+    # Empirical horizon-end return sample for the risk panel (fat tails kept).
+    horizon_resid = signed_resid.get(horizon) if signed_resid else None
+    if horizon_resid is not None and len(horizon_resid) >= _MIN_CAL:
+        out.attrs['risk_log_returns'] = (
+            np.asarray(horizon_resid, dtype=np.float64) * float(cum_sigma[-1]))
+        out.attrs['risk_source'] = 'Vol-LSTM conformal residuals (empirical)'
+
+    rs_down, rs_up = _realized_semivariance(returns[-min(len(returns), 60):])
+    denom = float(rs_down.sum() + rs_up.sum())
+    if denom > 0:
+        out.attrs['downside_share'] = round(float(rs_down.sum()) / denom, 3)
+    if k_lo is not None:
+        out.attrs['cone'] = 'asymmetric'
+        out.attrs['cone_k'] = {'lower': float(k_lo[-1]), 'upper': float(k_up[-1])}
+    out.attrs['vol_model'] = diag
+    if isinstance(diag, dict) and diag.get('architecture'):
+        out.attrs['architecture'] = diag['architecture']
+
+    print("Vol-LSTM Prediction Complete.")
+    return out
+
+
+def _guard_reason(step_var, mult, returns):
+    """Why a fitted cone is out of range (a short string), or None when it is sane."""
+    sd = np.sqrt(np.asarray(step_var, dtype=np.float64))
+    k = np.asarray(mult, dtype=np.float64)
+    if not (np.all(np.isfinite(sd)) and np.all(np.isfinite(k))):
+        return "non-finite forecast"
+    recent = np.asarray(returns, dtype=np.float64)[-_GUARD_WINDOW:]
+    ref = float(np.std(recent, ddof=1)) if len(recent) > 2 else 0.0
+    if ref > 0:
+        hi, lo = float(sd.max()) / ref, float(sd.min()) / ref
+        if hi > _GUARD_RATIO:
+            return f"forecast volatility {hi:.1f}x the last {_GUARD_WINDOW} sessions'"
+        if lo < 1.0 / _GUARD_RATIO:
+            return f"forecast volatility {lo:.2f}x the last {_GUARD_WINDOW} sessions'"
+    if float(k.max()) > _GUARD_K:
+        return f"conformal multiplier {float(k.max()):.1f} (normal 1.96)"
+    return None
+
+
+def _forecast_cone(prices, returns, lags, look_back, horizon, adaptive,
+                   aci_gamma, online_epochs):
+    """
+    Fit the network, forecast per-step variance, and conformalize the cone.
+
+    Split out from the orchestrator so the (long) statistical bookkeeping is
+    readable and so ``predict_step_variance`` below can reuse the same fit for
+    the model-comparison harness.
+
+    Returns
+    -------
+    (np.ndarray, np.ndarray, dict, dict)
+        ``(step_var, multipliers, signed_residuals, diagnostics)``.
+    """
+    n_rv = len(returns)
+    min_needed = look_back + horizon + _MIN_CAL + 40
+    if n_rv < max(_MIN_ROWS, min_needed):
+        print(f"Vol-LSTM: only {n_rv} return bars (< {max(_MIN_ROWS, min_needed)}) "
+              "— using the EWMA volatility fallback.")
+        return (_fallback_variance(returns, horizon),
+                np.full(horizon, _Z95), {},
+                {'fitted': False, 'reason': 'insufficient history',
+                 'n_bars': int(n_rv)})
+
+    channels, log_rv = build_rv_channels(returns, lags)
+
+    # ── Debias the log -> level transform ───────────────────────────────────
+    # The network predicts the mean of log(r^2). Exponentiating that mean does
+    # NOT give the conditional variance: with r = sigma * z, we have
+    # log(r^2) = log(sigma^2) + log(z^2), and E[log z^2] = -1.27 for a Gaussian z
+    # (the mean of a log-chi-squared(1)). So exp(prediction) understates sigma^2
+    # by a factor of ~e^-1.27 ~ 0.28, and the reported volatility would be badly
+    # biased low. The classic Jensen fix `exp(mu + resid_var/2)` is *also* wrong
+    # here, because the residual is log-chi-squared, not Gaussian — with a
+    # residual variance near pi^2/2 ~ 4.93 it over-corrects by an order of
+    # magnitude in variance terms.
+    #
+    # Instead the offset is estimated from the data: the constant `c` that makes
+    # the level forecast match the realised mean variance,
+    # ``c = log(mean(RV)) - mean(log RV)``. That reproduces the theoretical 1.27
+    # for Gaussian returns and self-adjusts for the percentile clipping applied
+    # above and for genuinely fat-tailed returns. Fitted on the training block
+    # only, so it carries no lookahead.
+    #
+    # This is not a hypothetical: ``run_vol_comparison.py`` measured HAR-RV --
+    # which uses the Gaussian-Jensen form -- over-stating volatility by ~1.9x on
+    # RELIANCE (bias_ratio 1.92 vs 1.25 here), with 2.5x the cumulative squared
+    # error. The conformal layer hides it (an inflated sigma is cancelled by a
+    # deflated multiplier, so coverage stays fine) which is exactly why the
+    # reported per-step volatility needs its own check. See the README section
+    # "Volatility model comparison -- and a latent bias it exposed in HAR-RV".
+    rv_all = np.asarray(returns, dtype=np.float64) ** 2
+
+    # Every usable RV origin: needs a full look-back behind and `horizon` ahead.
+    all_origins = list(range(look_back - 1, n_rv - horizon))
+    # Calibration origins additionally need `horizon` future PRICES beyond their
+    # own price index (o + 1), for the standardized-residual computation.
+    cal_size = max(_MIN_CAL, int(round(len(all_origins) * _CAL_FRAC)))
+    cal_size = min(cal_size, len(all_origins) - 40)
+    # Embargo `horizon` origins between train and calibration so no training
+    # label window overlaps a calibration label window (a purged split).
+    embargo = max(0, min(horizon, len(all_origins) - cal_size - 40))
+    train_origins = all_origins[:len(all_origins) - cal_size - embargo]
+    cal_origins = all_origins[-cal_size:]
+
+    X_tr, Y_tr = _make_samples(channels, log_rv, look_back, horizon, train_origins)
+    mu, sd = _standardize(X_tr)
+    X_tr = (X_tr - mu) / sd
+
+    model = train_vol_lstm(X_tr, Y_tr, online_epochs=online_epochs)
+
+    # ── Level offset, calibrated against the MODEL's own predictions ────────
+    # Two candidate offsets, and the difference matters:
+    #
+    #   (a) unconditional: log(mean RV) - mean(log RV) on the training block.
+    #       This corrects the log-chi-squared transform but NOT the network's own
+    #       conditional bias, so a model that systematically over-forecasts stays
+    #       over-forecasting. Measured bias ratio with (a): ~1.25.
+    #   (b) model-calibrated: log(mean RV_cal) - mean(predicted log RV_cal) on
+    #       the held-out calibration block. This absorbs the transform AND the
+    #       network's own bias in one scalar, because it asks 'what constant makes
+    #       THIS model's forecasts land on the realised level?'.
+    #
+    # (b) is used whenever a calibration block exists, with (a) as the fallback.
+    # Fitting one scalar on the calibration block is the same thing the conformal
+    # layer already does with its per-horizon multiplier, and the block is held
+    # out of training either way, so this adds no lookahead — but it is a second
+    # use of that block, which is why it is one scalar and not a fitted curve.
+    train_end = train_origins[-1] + 1
+    offset = float(np.log(max(float(np.mean(rv_all[:train_end])), _EPS))
+                   - float(np.mean(log_rv[:train_end])))
+    offset_mode = 'unconditional'
+
+    usable = [o for o in cal_origins if o + 1 + horizon <= len(prices) - 1]
+    if usable:
+        Xc = (np.stack([channels[o - look_back + 1:o + 1] for o in usable])
+              - mu) / sd
+        Yc = np.stack([log_rv[o + 1:o + horizon + 1] for o in usable])
+        Pc = np.asarray(model.predict(Xc, verbose=0))
+        cal_offset = float(np.log(max(float(np.mean(np.exp(Yc))), _EPS))
+                           - float(np.mean(Pc)))
+        if np.isfinite(cal_offset):
+            offset, offset_mode = cal_offset, 'model-calibrated'
+
+    def _step_var_at(origins):
+        """Per-step variance forecasts for a batch of origins (debiased level)."""
+        Xb = (np.stack([channels[o - look_back + 1:o + 1] for o in origins])
+              - mu) / sd
+        logv = np.asarray(model.predict(Xb, verbose=0))
+        return np.exp(logv + offset)
+
+    # ── Conformal calibration on the held-out recent block ──────────────────
+    resid = {h: [] for h in range(1, horizon + 1)}
+    signed = {h: [] for h in range(1, horizon + 1)}
+    if usable:
+        sv = _step_var_at(usable)
+        cum_sigma = np.sqrt(np.cumsum(sv, axis=1))
+        for row, o in enumerate(usable):
+            p_idx = o + 1                       # price index of the RV origin
+            for h in range(1, horizon + 1):
+                s = float(cum_sigma[row, h - 1])
+                if s > 0:
+                    cr = float(np.log(prices[p_idx + h] / prices[p_idx]))
+                    resid[h].append(abs(cr) / s)
+                    signed[h].append(cr / s)
+
+    mult = np.full(horizon, _Z95)
+    for h in range(1, horizon + 1):
+        z = resid[h]
+        m = len(z)
+        if m >= _MIN_CAL:
+            q_level = min(1.0, np.ceil((m + 1) * (1 - 0.05)) / m)
+            mult[h - 1] = float(np.quantile(z, q_level))
+    signed = {h: np.asarray(v, dtype=np.float64) for h, v in signed.items()}
+
+    mode = "static"
+    if adaptive and any(len(v) >= _MIN_CAL for v in signed.values()):
+        mult = _aci_multipliers(signed, horizon, gamma=aci_gamma)
+        mode = "ACI-adaptive"
+
+    # ── Serving forecast: the most recent origin ────────────────────────────
+    step_var = _step_var_at([n_rv - 1])[0]
+
+    print(f"Vol-LSTM fit ({len(train_origins)} train / {len(usable)} cal windows); "
+          f"next-step vol {np.sqrt(step_var[0]):.4%}; {mode} conformal k(h) "
+          f"{np.round(mult, 2)} (normal=1.96)")
+
+    diag = {
+        'fitted': True,
+        'mode': mode,
+        'look_back': int(look_back),
+        'train_windows': int(len(train_origins)),
+        'cal_windows': int(len(usable)),
+        'embargo': int(embargo),
+        'level_offset': round(offset, 4),
+        'level_offset_mode': offset_mode,
+        'next_step_vol': float(np.sqrt(step_var[0])),
+        'online_epochs': int(online_epochs),
+    }
+    # The trained Keras object exists only inside this function, so the
+    # architecture is captured here and travels out on ``diag``. Recording it
+    # where the model is NOT in scope would have produced a silent no-op.
+    try:
+        import architectures as _arch
+        diag['architecture'] = _arch.describe(model, 'Vol-LSTM')
+    except Exception:
+        pass
+    reason = _guard_reason(step_var, mult, returns)
+    if reason:
+        print(f"Vol-LSTM: {reason}; using the EWMA volatility fallback.")
+        diag.update(mode='EWMA fallback (guard)', guard=reason)
+        return _fallback_variance(returns, horizon), np.full(horizon, _Z95), {}, diag
+    return step_var, mult, signed, diag
+
+
+# ==========================================
+# 5. Model comparison (book Ch. 5: cumulative squared error)
+# ==========================================
+def cumulative_squared_error(actual_rv, predicted_rv):
+    """
+    Running sum of squared variance-forecast errors, as the book plots it.
+
+    A single aggregate score hides *when* a volatility model earns or loses its
+    edge; the cumulative curve makes it visible — a flat stretch means the models
+    tie, and a step means one of them mispriced a specific shock. Comparing two
+    curves is how the book decides between LSTM, RNN and GARCH.
+
+    Parameters
+    ----------
+    actual_rv, predicted_rv : array-like
+        Realised and forecast variance, aligned element-wise.
 
     Returns
     -------
     np.ndarray
-        Conditional sigma per bar, same length as ``returns``, plus the
-        next-bar forecast appended is *not* included (use
-        :func:`ewma_next_sigma` for that).
+        Cumulative squared error, same length as the inputs.
     """
-    r = np.asarray(returns, dtype=np.float64)
-    n = len(r)
-    if n == 0:
-        return np.array([])
-    seed = float(np.var(r[:min(warmup, n)])) if n > 1 else float(r[0] ** 2)
-    sigma2 = np.empty(n, dtype=np.float64)
-    v = max(seed, _EPS)
-    for t in range(n):
-        sigma2[t] = v
-        v = lam * v + (1.0 - lam) * r[t] * r[t]
-    return np.sqrt(np.maximum(sigma2, _EPS))
+    a = np.asarray(actual_rv, dtype=np.float64)
+    p = np.asarray(predicted_rv, dtype=np.float64)
+    n = min(len(a), len(p))
+    return np.cumsum((a[:n] - p[:n]) ** 2)
 
 
-def ewma_next_sigma(returns, lam=EWMA_LAMBDA, warmup=20):
-    """Conditional sigma forecast for the bar *after* the last observation."""
-    r = np.asarray(returns, dtype=np.float64)
-    if len(r) == 0:
+def qlike_loss(actual_rv, predicted_rv):
+    """
+    QLIKE loss ``sum(RV/sigma^2 + log sigma^2)`` — the standard variance score.
+
+    Squared error on *variance* is dominated by the largest observations and is
+    not robust when the variance proxy is noisy (``r^2`` is an extremely noisy
+    proxy for the day's true variance). QLIKE is the loss function shown by
+    Patton (2011) to be robust to that proxy noise, so it is the fairer of the
+    two scores for ranking volatility models — reported alongside the book's
+    cumulative squared error rather than instead of it.
+
+    Returns
+    -------
+    float
+        Mean QLIKE loss (lower is better); NaN if no valid pairs.
+    """
+    a = np.asarray(actual_rv, dtype=np.float64)
+    p = np.asarray(predicted_rv, dtype=np.float64)
+    n = min(len(a), len(p))
+    a, p = a[:n], p[:n]
+    mask = np.isfinite(a) & np.isfinite(p) & (p > 0)
+    if not mask.any():
         return float('nan')
-    sig = ewma_volatility(r, lam=lam, warmup=warmup)
-    v = sig[-1] ** 2
-    v = lam * v + (1.0 - lam) * r[-1] ** 2
-    return float(math.sqrt(max(v, _EPS)))
-
-
-# ==========================================
-# 1. Variance-covariance (parametric normal)
-# ==========================================
-def var_variance_covariance(returns, alpha=0.05, horizon=1, ewma=True):
-    """
-    Parametric VaR under a normal return distribution.
-
-    The book's first method and the industry's oldest: estimate mu and sigma,
-    then read the alpha-quantile off a Gaussian. Its **documented drawback** is
-    the whole reason the later methods exist — equity returns are leptokurtic
-    and left-skewed, so a Gaussian systematically *understates* the tail. At
-    alpha = 1% the understatement is typically severe.
-
-    Multi-step scaling uses the square-root-of-time rule
-    (``mu*h``, ``sigma*sqrt(h)``), which is exact only for i.i.d. returns — a
-    second drawback, since volatility clusters.
-
-    Parameters
-    ----------
-    returns : array-like
-        Per-bar log returns.
-    alpha : float, optional
-        Tail probability. Default 0.05.
-    horizon : int, optional
-        Steps ahead. Default 1.
-    ewma : bool, optional
-        Use the EWMA conditional sigma (responsive to the current regime)
-        instead of the unconditional sample sigma. Default True.
-
-    Returns
-    -------
-    dict
-        {'method', 'var_return', 'var_loss', 'es_return', 'sigma', 'mu'}.
-    """
-    r = np.asarray(returns, dtype=np.float64)
-    r = r[np.isfinite(r)]
-    if len(r) < 5:
-        return {'method': 'variance-covariance', 'var_return': float('nan'),
-                'var_loss': float('nan'), 'es_return': float('nan'),
-                'sigma': float('nan'), 'mu': float('nan')}
-
-    mu = float(np.mean(r))
-    sigma = ewma_next_sigma(r) if ewma else float(np.std(r, ddof=1))
-
-    mu_h = mu * horizon
-    sigma_h = sigma * math.sqrt(horizon)
-    z = _norm_ppf(alpha)
-
-    var_log = mu_h + z * sigma_h
-    # Gaussian ES of the LOG return is mu - sigma * phi(z)/alpha, but es_return
-    # is a simple return, so take the lognormal tail mean instead (see _tail_es).
-    es_simple = _gaussian_es_gross(mu_h, sigma_h, alpha) - 1.0
-
-    return {
-        'method': 'variance-covariance',
-        'var_return': float(math.expm1(var_log)),
-        'var_loss': float(-math.expm1(var_log)),
-        'es_return': float(es_simple),
-        'sigma': float(sigma_h),
-        'mu': float(mu_h),
-    }
-
-
-# ==========================================
-# 2. Historical simulation
-# ==========================================
-def var_historical_simulation(returns, alpha=0.05, horizon=1, overlapping=True):
-    """
-    Non-parametric VaR: the empirical alpha-quantile of realised returns.
-
-    The book's second method. It makes no distributional assumption, so it keeps
-    the fat tails — but its **drawbacks** are equally well known:
-
-    * It is **backward-looking and unconditional**: every observation in the
-      window gets the same weight, so a calm estimate persists into a crisis and
-      a crisis estimate persists into the recovery. It cannot respond to today's
-      volatility at all.
-    * The tail is estimated from very few points (5% of 250 bars = 12
-      observations), so the number is noisy and moves in jumps as extremes enter
-      and leave the window.
-    * Multi-step estimates need overlapping windows, which makes the effective
-      sample far smaller than it looks.
-
-    Filtered Historical Simulation (below) fixes the first drawback while
-    keeping the empirical tail.
-
-    Parameters
-    ----------
-    returns : array-like
-        Per-bar log returns.
-    alpha : float, optional
-        Tail probability. Default 0.05.
-    horizon : int, optional
-        Steps ahead; > 1 aggregates with a rolling sum. Default 1.
-    overlapping : bool, optional
-        Use overlapping h-bar windows (more points, serially dependent) rather
-        than disjoint blocks. Default True.
-
-    Returns
-    -------
-    dict
-        {'method', 'var_return', 'var_loss', 'es_return', 'n_obs'}.
-    """
-    r = np.asarray(returns, dtype=np.float64)
-    r = r[np.isfinite(r)]
-    nan = {'method': 'historical-simulation', 'var_return': float('nan'),
-           'var_loss': float('nan'), 'es_return': float('nan'), 'n_obs': 0}
-    if len(r) < 10:
-        return nan
-
-    if horizon <= 1:
-        agg = r
-    elif overlapping:
-        agg = np.convolve(r, np.ones(horizon), mode='valid')
-    else:
-        k = len(r) // horizon
-        if k < 5:
-            return nan
-        agg = r[-k * horizon:].reshape(k, horizon).sum(axis=1)
-
-    if len(agg) < 10:
-        return nan
-
-    q = float(np.quantile(agg, alpha))
-
-    return {
-        'method': 'historical-simulation',
-        'var_return': float(math.expm1(q)),
-        'var_loss': float(-math.expm1(q)),
-        'es_return': _tail_es(agg, q),
-        'n_obs': int(len(agg)),
-    }
-
-
-# ==========================================
-# 3. Cornish-Fisher (skew/kurtosis-adjusted parametric)
-# ==========================================
-def var_cornish_fisher(returns, alpha=0.05, horizon=1, ewma=True):
-    """
-    Parametric VaR with a Cornish-Fisher expansion for skew and excess kurtosis.
-
-    The cheapest honest repair of the variance-covariance method: keep the
-    conditional sigma, but shift the Gaussian quantile using the sample third
-    and fourth moments::
-
-        z_cf = z + (z^2 - 1) S / 6 + (z^3 - 3z) K / 24
-               - (2 z^3 - 5 z) S^2 / 36
-
-    where ``S`` is skewness and ``K`` excess kurtosis.
-
-    **Read the sign of each term before trusting this.** The kurtosis term is
-    proportional to ``z^3 - 3z``, which is *positive* for ``|z| < sqrt(3) ~ 1.732``
-    — and the 5% quantile sits at ``z = -1.645``, inside that range. So at
-    ``alpha = 0.05`` a large excess kurtosis makes the adjusted quantile **less**
-    negative, i.e. it *reduces* the reserve, which is the opposite of what "fat
-    tails" intuitively suggests. The fat-tail correction only widens the estimate
-    further out in the tail (``alpha <~ 0.025``, where ``z^3 - 3z`` turns
-    negative). On a long, highly-leptokurtic history this is not a subtlety: it
-    can drive the 5% exception rate to double its nominal level.
-
-    That is why the expansion is included as the documented "one-line improvement
-    over normal" **reference point and cautionary case**, not as a recommended
-    estimator. It is asymptotic in the moments, so it degrades exactly where a
-    risk model needs to be reliable; ``var_filtered_historical_simulation`` is the
-    method to reach for instead. ``backtest_var`` will show this directly — see
-    the Cornish-Fisher row of ``compare_var_methods``.
-
-    Returns
-    -------
-    dict
-        {'method', 'var_return', 'var_loss', 'es_return', 'skew', 'excess_kurtosis'}.
-    """
-    r = np.asarray(returns, dtype=np.float64)
-    r = r[np.isfinite(r)]
-    if len(r) < 30:
-        return {'method': 'cornish-fisher', 'var_return': float('nan'),
-                'var_loss': float('nan'), 'es_return': float('nan'),
-                'skew': float('nan'), 'excess_kurtosis': float('nan')}
-
-    mu = float(np.mean(r))
-    sd = float(np.std(r, ddof=1))
-    if sd <= _EPS:
-        return {'method': 'cornish-fisher', 'var_return': 0.0, 'var_loss': 0.0,
-                'es_return': 0.0, 'skew': 0.0, 'excess_kurtosis': 0.0}
-    z_std = (r - mu) / sd
-    S = float(np.mean(z_std ** 3))
-    K = float(np.mean(z_std ** 4) - 3.0)
-
-    z = _norm_ppf(alpha)
-    z_cf = (z
-            + (z ** 2 - 1.0) * S / 6.0
-            + (z ** 3 - 3.0 * z) * K / 24.0
-            - (2.0 * z ** 3 - 5.0 * z) * S ** 2 / 36.0)
-
-    sigma = ewma_next_sigma(r) if ewma else sd
-    mu_h = mu * horizon
-    sigma_h = sigma * math.sqrt(horizon)
-    var_log = mu_h + z_cf * sigma_h
-    # No closed-form ES under Cornish-Fisher; use the Gaussian ES shape scaled by
-    # the ratio of the adjusted to the Gaussian quantile (a documented approximation).
-    ratio = z_cf / z if abs(z) > _EPS else 1.0
-    es_log = mu_h - sigma_h * _norm_pdf(z) / alpha * ratio
-    # The same log-to-simple (Jensen) correction the Gaussian of this sigma
-    # needs, applied to the scaled shape; see _tail_es.
-    gauss_log = mu_h - sigma_h * _norm_pdf(z) / alpha
-    jensen = _gaussian_es_gross(mu_h, sigma_h, alpha) / math.exp(gauss_log)
-
-    return {
-        'method': 'cornish-fisher',
-        'var_return': float(math.expm1(var_log)),
-        'var_loss': float(-math.expm1(var_log)),
-        'es_return': float(math.exp(es_log) * jensen - 1.0),
-        'skew': S,
-        'excess_kurtosis': K,
-    }
-
-
-# ==========================================
-# 4. Filtered Historical Simulation
-# ==========================================
-def var_filtered_historical_simulation(returns, alpha=0.05, horizon=1,
-                                       lam=EWMA_LAMBDA, n_sims=_N_SIMS,
-                                       seed=42):
-    """
-    Filtered Historical Simulation (Barone-Adesi, Giannopoulos & Vosper).
-
-    The estimator that fixes historical simulation's fatal flaw while keeping its
-    virtue. Three steps:
-
-    1. **Filter.** Divide each return by its one-step-ahead EWMA conditional
-       volatility, giving standardized residuals ``z_t = r_t / sigma_t``. These
-       are approximately i.i.d. — the volatility clustering has been removed —
-       but they retain the *shape* of the return distribution: the skew and the
-       fat tails.
-    2. **Resample.** Bootstrap from the ``z`` pool and rescale by the *current*
-       volatility forecast, propagating the EWMA recursion forward so simulated
-       shocks feed the next step's variance. This is what makes the estimate
-       **conditional**: after a volatile week the whole simulated distribution
-       widens, immediately, without waiting for the historical window to turn
-       over.
-    3. **Read the quantile** off the simulated ``horizon``-step cumulative
-       returns.
-
-    The result is a conditional, distribution-free, path-dependent VaR — the
-    honest workhorse the book's GAN chapter is reaching for, achieved with a
-    filter and a bootstrap instead of an adversarial network that needs far more
-    data than a single stock's history provides.
-
-    Parameters
-    ----------
-    returns : array-like
-        Per-bar log returns.
-    alpha : float, optional
-        Tail probability. Default 0.05.
-    horizon : int, optional
-        Steps ahead. Default 1.
-    lam : float, optional
-        EWMA decay. Default 0.94.
-    n_sims : int, optional
-        Simulated paths. Default 20000.
-    seed : int, optional
-        RNG seed for reproducibility. Default 42.
-
-    Returns
-    -------
-    dict
-        {'method', 'var_return', 'var_loss', 'es_return', 'sigma_forecast',
-         'samples'} — ``samples`` is the simulated cumulative log-return array,
-        reusable for any other tail statistic.
-    """
-    r = np.asarray(returns, dtype=np.float64)
-    r = r[np.isfinite(r)]
-    nan = {'method': 'filtered-historical-simulation', 'var_return': float('nan'),
-           'var_loss': float('nan'), 'es_return': float('nan'),
-           'sigma_forecast': float('nan'), 'samples': np.array([])}
-    if len(r) < 60:
-        return nan
-
-    sig = ewma_volatility(r, lam=lam)
-    z = r / np.maximum(sig, _EPS)
-    z = z[np.isfinite(z)]
-    if len(z) < 40:
-        return nan
-    # Rescale the pool to unit variance so the filter's seeding bias does not
-    # inflate or deflate the simulated dispersion.
-    z = z / max(float(np.std(z, ddof=1)), _EPS)
-
-    sigma0 = ewma_next_sigma(r, lam=lam)
-    rng = np.random.default_rng(seed)
-
-    cum = np.zeros(n_sims, dtype=np.float64)
-    var_state = np.full(n_sims, sigma0 ** 2, dtype=np.float64)
-    for _ in range(int(horizon)):
-        draws = rng.choice(z, size=n_sims, replace=True)
-        step = np.sqrt(var_state) * draws
-        cum += step
-        var_state = lam * var_state + (1.0 - lam) * step ** 2
-
-    q = float(np.quantile(cum, alpha))
-
-    return {
-        'method': 'filtered-historical-simulation',
-        'var_return': float(math.expm1(q)),
-        'var_loss': float(-math.expm1(q)),
-        'es_return': _tail_es(cum, q),
-        'sigma_forecast': float(sigma0),
-        'samples': cum,
-    }
-
-
-# ==========================================
-# 5. Generative sampler (the book's Ch. 9 technique)
-# ==========================================
-def generative_return_samples(returns, horizon=1, n_sims=_N_SIMS, seed=42,
-                              block_mean=5, prefer_gan=False, gan_epochs=400):
-    """
-    Draw simulated ``horizon``-step cumulative returns from a generative model.
-
-    Chapter 9 trains a **GAN** to learn the return distribution and reads VaR off
-    generated samples. That idea is sound but, applied to a single stock, it runs
-    into a hard data limit that is worth stating plainly rather than papering
-    over: a GAN on ~1000 daily returns is fitting a distribution from a sample
-    that is small even for a histogram. In practice it mode-collapses or memorises,
-    and its tail — the only region VaR cares about — is where it is least
-    trustworthy. That is a bad trade for a risk number.
-
-    So the default generator here is a **stationary block bootstrap** (Politis &
-    Romano): resample contiguous blocks of geometric length so each draw keeps
-    the time structure *inside* a block, not just the marginal distribution.
-    It needs no training, cannot mode-collapse, and is reproducible.
-
-    How much of the structure it keeps was measured later (README §57,
-    ``synthetic_check``): at the default mean block of 5 it keeps about a
-    fifth of NSE's volatility clustering and less of the fat tails of 20-day
-    sums (median ratios 0.20 and 0.12 over 5 seeded paths per name); a mean
-    block of 40 keeps ~0.6 and ~0.85. The default is left at 5 because the test that
-    matters for this function, multi-day VaR coverage, did not separate the
-    two (1% 5-day exception rate 1.59% vs 1.36%, identical at 10 days and at
-    5%, on 10 names). The optional GAN keeps none of it: it maps independent
-    noise to returns one day at a time.
-
-    ``prefer_gan=True`` opts into a compact 1-D GAN over standardized windows
-    for comparison. It imports TensorFlow lazily and silently falls back to the
-    block bootstrap on any failure, so enabling it can never break a caller —
-    but treat its tail with suspicion and check it with
-    :func:`backtest_var` before relying on it.
-
-    Parameters
-    ----------
-    returns : array-like
-        Per-bar log returns.
-    horizon : int, optional
-        Steps to aggregate per sample. Default 1.
-    n_sims : int, optional
-        Number of samples to draw. Default 20000.
-    seed : int, optional
-        RNG seed. Default 42.
-    block_mean : int, optional
-        Mean block length for the stationary bootstrap. Default 5.
-    prefer_gan : bool, optional
-        Try the GAN generator first. Default False.
-    gan_epochs : int, optional
-        Training epochs for the GAN attempt. Default 400.
-
-    Returns
-    -------
-    (np.ndarray, str)
-        ``(samples, generator_used)`` where ``generator_used`` is
-        ``'gan'`` or ``'block-bootstrap'``.
-    """
-    r = np.asarray(returns, dtype=np.float64)
-    r = r[np.isfinite(r)]
-    if len(r) < 60:
-        return np.array([]), 'insufficient-data'
-
-    if prefer_gan:
-        try:
-            samples = _gan_samples(r, horizon, n_sims, seed, gan_epochs)
-            if samples is not None and len(samples) == n_sims:
-                return samples, 'gan'
-        except Exception as exc:
-            print(f"var_models: GAN generator failed ({exc}); "
-                  "falling back to the block bootstrap.")
-
-    rng = np.random.default_rng(seed)
-    n = len(r)
-    p = 1.0 / max(block_mean, 1)
-
-    # Stationary bootstrap: start at a random index, continue to the next index
-    # with probability 1-p, otherwise jump to a fresh random index. Wrapping
-    # keeps the series stationary (no edge under-sampling).
-    out = np.empty(n_sims, dtype=np.float64)
-    idx = rng.integers(0, n, size=n_sims)
-    total = np.zeros(n_sims, dtype=np.float64)
-    for _ in range(int(horizon)):
-        total += r[idx]
-        jump = rng.random(n_sims) < p
-        idx = np.where(jump, rng.integers(0, n, size=n_sims), (idx + 1) % n)
-    out[:] = total
-    return out, 'block-bootstrap'
-
-
-def _gan_samples(returns, horizon, n_sims, seed, epochs):
-    """
-    Train a small 1-D GAN on standardized returns and sample from it.
-
-    Architecture is intentionally tiny (two 32-unit hidden layers each side) with
-    label smoothing on the discriminator — the standard minimum needed to keep a
-    GAN from collapsing on a few hundred samples. Returns None on any problem so
-    the caller can fall back.
-    """
-    try:
-        import tensorflow as tf
-    except Exception:
-        return None
-
-    from reproducibility import set_all_seeds
-    set_all_seeds(seed)
-
-    r = np.asarray(returns, dtype=np.float64)
-    mu, sd = float(np.mean(r)), float(np.std(r, ddof=1))
-    if sd <= _EPS:
-        return None
-    real = ((r - mu) / sd).reshape(-1, 1).astype('float32')
-
-    latent = 8
-    gen = tf.keras.Sequential([
-        tf.keras.layers.Input(shape=(latent,)),
-        tf.keras.layers.Dense(32, activation='relu'),
-        tf.keras.layers.Dense(32, activation='relu'),
-        tf.keras.layers.Dense(1),
-    ])
-    disc = tf.keras.Sequential([
-        tf.keras.layers.Input(shape=(1,)),
-        tf.keras.layers.Dense(32, activation='relu'),
-        tf.keras.layers.Dense(32, activation='relu'),
-        tf.keras.layers.Dense(1, activation='sigmoid'),
-    ])
-    bce = tf.keras.losses.BinaryCrossentropy()
-    g_opt = tf.keras.optimizers.Adam(1e-3, beta_1=0.5)
-    d_opt = tf.keras.optimizers.Adam(1e-3, beta_1=0.5)
-    batch = min(128, len(real))
-
-    for _ in range(int(epochs)):
-        real_batch = real[np.random.randint(0, len(real), batch)]
-        noise = tf.random.normal([batch, latent])
-        fake = gen(noise, training=False)
-        with tf.GradientTape() as tape:
-            d_loss = (bce(tf.ones([batch, 1]) * 0.9, disc(real_batch, training=True))
-                      + bce(tf.zeros([batch, 1]), disc(fake, training=True)))
-        d_opt.apply_gradients(zip(tape.gradient(d_loss, disc.trainable_variables),
-                                  disc.trainable_variables))
-        noise = tf.random.normal([batch, latent])
-        with tf.GradientTape() as tape:
-            g_loss = bce(tf.ones([batch, 1]),
-                         disc(gen(noise, training=True), training=False))
-        g_opt.apply_gradients(zip(tape.gradient(g_loss, gen.trainable_variables),
-                                  gen.trainable_variables))
-
-    noise = tf.random.normal([n_sims * int(horizon), latent])
-    gen_std = np.asarray(gen(noise, training=False)).reshape(n_sims, int(horizon))
-    return (gen_std * sd + mu).sum(axis=1).astype(np.float64)
-
-
-def var_generative(returns, alpha=0.05, horizon=1, n_sims=_N_SIMS, seed=42,
-                   prefer_gan=False):
-    """
-    VaR / ES read off :func:`generative_return_samples`.
-
-    Returns the same dict shape as the other estimators, plus ``generator`` so a
-    comparison table records which sampler actually ran.
-    """
-    samples, gen = generative_return_samples(
-        returns, horizon=horizon, n_sims=n_sims, seed=seed, prefer_gan=prefer_gan)
-    if len(samples) == 0:
-        return {'method': 'generative', 'generator': gen,
-                'var_return': float('nan'), 'var_loss': float('nan'),
-                'es_return': float('nan'), 'samples': samples}
-    q = float(np.quantile(samples, alpha))
-    return {
-        'method': f'generative ({gen})',
-        'generator': gen,
-        'var_return': float(math.expm1(q)),
-        'var_loss': float(-math.expm1(q)),
-        'es_return': _tail_es(samples, q),
-        'samples': samples,
-    }
-
-
-# ==========================================
-# 6. VaR backtests (book: "Benchmarking results")
-# ==========================================
-def kupiec_pof_test(exceptions, alpha=0.05):
-    """
-    Kupiec proportion-of-failures test of **unconditional** VaR coverage.
-
-    Asks the first question any VaR number must answer: did the loss exceed the
-    threshold about ``alpha`` of the time? Under H0 the exception count is
-    Binomial(n, alpha), and the likelihood ratio::
-
-        LR_pof = -2 ln[ (1-alpha)^(n-x) alpha^x
-                        / ((1 - x/n)^(n-x) (x/n)^x ) ]
-
-    is asymptotically chi-squared with 1 degree of freedom. A small p-value means
-    the VaR is mis-calibrated: too many exceptions (understating risk — the
-    dangerous direction) or too few (overstating it, which is merely expensive).
-
-    Parameters
-    ----------
-    exceptions : array-like of bool/int
-        1 where the realised loss breached the VaR threshold, else 0.
-    alpha : float, optional
-        The VaR's nominal tail probability. Default 0.05.
-
-    Returns
-    -------
-    dict
-        {'n', 'exceptions', 'observed_rate', 'expected_rate', 'lr_stat',
-         'p_value', 'reject_5pct', 'direction'} — ``direction`` is
-        'understates risk' / 'overstates risk' / 'ok'.
-    """
-    e = np.asarray(exceptions, dtype=np.float64)
-    e = e[np.isfinite(e)]
-    n = len(e)
-    x = int(np.sum(e > 0))
-    out = {'n': n, 'exceptions': x, 'observed_rate': float('nan'),
-           'expected_rate': float(alpha), 'lr_stat': float('nan'),
-           'p_value': float('nan'), 'reject_5pct': False, 'direction': 'n/a'}
-    if n < 10:
-        return out
-
-    rate = x / n
-    out['observed_rate'] = float(rate)
-    out['direction'] = ('understates risk' if rate > alpha
-                        else 'overstates risk' if rate < alpha else 'ok')
-
-    # Degenerate corners: the log-likelihood of the observed rate is 0 there.
-    if x == 0:
-        lr = -2.0 * (n * math.log(1.0 - alpha))
-    elif x == n:
-        lr = -2.0 * (n * math.log(alpha))
-    else:
-        ll_null = (n - x) * math.log(1.0 - alpha) + x * math.log(alpha)
-        ll_obs = (n - x) * math.log(1.0 - rate) + x * math.log(rate)
-        lr = -2.0 * (ll_null - ll_obs)
-
-    out['lr_stat'] = float(lr)
-    out['p_value'] = _chi2_sf(lr, 1)
-    out['reject_5pct'] = bool(out['p_value'] < 0.05)
-    return out
-
-
-def christoffersen_independence_test(exceptions):
-    """
-    Christoffersen independence test: are VaR breaches **clustered**?
-
-    The question Kupiec cannot answer. A model can breach exactly 5% of the time
-    and still be worthless if all its breaches arrive consecutively, because
-    that is the pattern that wipes out a position. Under H0 the exception
-    indicator is a first-order Markov chain with ``pi_01 = pi_11`` (the
-    probability of a breach does not depend on whether yesterday breached), and::
-
-        LR_ind = -2 ln[ (1-pi)^(n00+n10) pi^(n01+n11)
-                        / ((1-pi01)^n00 pi01^n01 (1-pi11)^n10 pi11^n11) ]
-
-    is asymptotically chi-squared with 1 df. Rejection means the breaches are
-    serially dependent — the signature of a VaR model that ignores volatility
-    clustering (exactly the historical-simulation drawback).
-
-    Returns
-    -------
-    dict
-        {'n00', 'n01', 'n10', 'n11', 'lr_stat', 'p_value', 'reject_5pct',
-         'clustering'} — ``clustering`` is True when ``pi_11 > pi_01``.
-    """
-    e = (np.asarray(exceptions, dtype=np.float64) > 0).astype(int)
-    out = {'n00': 0, 'n01': 0, 'n10': 0, 'n11': 0, 'lr_stat': float('nan'),
-           'p_value': float('nan'), 'reject_5pct': False, 'clustering': False}
-    if len(e) < 12:
-        return out
-
-    prev, cur = e[:-1], e[1:]
-    n00 = int(np.sum((prev == 0) & (cur == 0)))
-    n01 = int(np.sum((prev == 0) & (cur == 1)))
-    n10 = int(np.sum((prev == 1) & (cur == 0)))
-    n11 = int(np.sum((prev == 1) & (cur == 1)))
-    out.update({'n00': n00, 'n01': n01, 'n10': n10, 'n11': n11})
-
-    total = n00 + n01 + n10 + n11
-    if total == 0:
-        return out
-    pi = (n01 + n11) / total
-    pi01 = n01 / (n00 + n01) if (n00 + n01) else 0.0
-    pi11 = n11 / (n10 + n11) if (n10 + n11) else 0.0
-    out['clustering'] = bool(pi11 > pi01)
-
-    # A degenerate transition table (no breaches, or no 1->* transitions) leaves
-    # the test undefined; report the counts and stop rather than emit a fake p.
-    if pi <= 0 or pi >= 1 or (n10 + n11) == 0:
-        return out
-
-    def _ll(k0, k1, p):
-        if p <= 0 or p >= 1:
-            return 0.0 if (k1 == 0 or p > 0) and (k0 == 0 or p < 1) else float('-inf')
-        return k0 * math.log(1.0 - p) + k1 * math.log(p)
-
-    ll_null = _ll(n00 + n10, n01 + n11, pi)
-    ll_alt = _ll(n00, n01, pi01) + _ll(n10, n11, pi11)
-    if not (np.isfinite(ll_null) and np.isfinite(ll_alt)):
-        return out
-
-    lr = -2.0 * (ll_null - ll_alt)
-    out['lr_stat'] = float(max(lr, 0.0))
-    out['p_value'] = _chi2_sf(out['lr_stat'], 1)
-    out['reject_5pct'] = bool(out['p_value'] < 0.05)
-    return out
-
-
-def christoffersen_conditional_coverage(exceptions, alpha=0.05):
-    """
-    Joint conditional-coverage test: correct *rate* **and** independence.
-
-    ``LR_cc = LR_pof + LR_ind`` is asymptotically chi-squared with 2 df. This is
-    the summary verdict — a VaR model passes only if it breaches at the right
-    frequency *and* its breaches are not clustered.
-
-    Returns
-    -------
-    dict
-        {'lr_stat', 'p_value', 'reject_5pct', 'pof', 'independence'} where the
-        last two are the component test results.
-    """
-    pof = kupiec_pof_test(exceptions, alpha=alpha)
-    ind = christoffersen_independence_test(exceptions)
-    lr_p, lr_i = pof.get('lr_stat'), ind.get('lr_stat')
-    if not (np.isfinite(lr_p or np.nan) and np.isfinite(lr_i or np.nan)):
-        return {'lr_stat': float('nan'), 'p_value': float('nan'),
-                'reject_5pct': False, 'pof': pof, 'independence': ind}
-    lr = float(lr_p + lr_i)
-    return {'lr_stat': lr, 'p_value': _chi2_sf(lr, 2),
-            'reject_5pct': bool(_chi2_sf(lr, 2) < 0.05),
-            'pof': pof, 'independence': ind}
-
-
-# ==========================================
-# 7. Rolling out-of-sample harness + comparison
-# ==========================================
-#: Estimators available to :func:`backtest_var` / :func:`compare_var_methods`.
-VAR_ESTIMATORS = {
-    'variance-covariance': lambda r, a, h: var_variance_covariance(r, a, h),
-    'historical': lambda r, a, h: var_historical_simulation(r, a, h),
-    'cornish-fisher': lambda r, a, h: var_cornish_fisher(r, a, h),
-    'fhs': lambda r, a, h: var_filtered_historical_simulation(r, a, h, n_sims=4000),
-    'generative': lambda r, a, h: var_generative(r, a, h, n_sims=4000),
-}
-
-
-def returns_from_prices(prices):
-    """Log returns from a positive price array (non-positive values dropped)."""
-    p = np.asarray(prices, dtype=np.float64)
-    p = p[np.isfinite(p) & (p > 0)]
-    return np.diff(np.log(p)) if len(p) > 1 else np.array([])
-
-
-def backtest_var(returns, method='fhs', alpha=0.05, horizon=1, window=250,
-                 step=1, estimator=None):
-    """
-    Rolling out-of-sample VaR backtest with the full test battery.
-
-    At each step the estimator sees only ``returns[:t]`` (a genuine expanding-
-    then-rolling window), forecasts the ``horizon``-step VaR, and is scored
-    against the realised ``horizon``-step return. Exceptions are then run through
-    Kupiec, Christoffersen and their joint test.
-
-    Two reported extras matter as much as the p-values:
-
-    * **average VaR magnitude** — a model can pass coverage by simply being
-      enormous; the width tells you what that safety cost.
-    * **mean exceedance beyond VaR** (a positive magnitude) — how far past the
-      threshold the loss went when it breached, which is the empirical analogue
-      of expected shortfall and distinguishes "a few small breaks" from "one
-      catastrophic one".
-
-    A note on the independence test's power: with thousands of evaluations it will
-    reject on essentially any real equity series spanning multiple crises, because
-    volatility clustering is real and the test is consistent. On large samples,
-    read the *relative* LR statistics across methods rather than the pass/fail
-    label — a conditional method should have a materially smaller LR than an
-    unconditional one even when both formally reject.
-
-    Parameters
-    ----------
-    returns : array-like
-        Full per-bar log-return history.
-    method : str, optional
-        Key into :data:`VAR_ESTIMATORS`. Default 'fhs'.
-    alpha : float, optional
-        Tail probability. Default 0.05.
-    horizon : int, optional
-        VaR horizon in bars. Default 1.
-    window : int, optional
-        Trailing window handed to the estimator. Default 250.
-    step : int, optional
-        Bars between evaluations. Use ``step >= horizon`` to keep the exception
-        sequence non-overlapping — required for the independence test to mean
-        what it says. Default 1.
-    estimator : callable, optional
-        Custom ``fn(returns, alpha, horizon) -> dict`` overriding ``method``.
-
-    Returns
-    -------
-    dict
-        {'method', 'alpha', 'horizon', 'n_eval', 'exception_rate',
-         'avg_var_loss', 'mean_exceedance', 'kupiec', 'independence',
-         'conditional_coverage', 'records'} where ``records`` is a DataFrame of
-         per-step (var_return, realised, exception).
-    """
-    r = np.asarray(returns, dtype=np.float64)
-    r = r[np.isfinite(r)]
-    fn = estimator or VAR_ESTIMATORS.get(method)
-    if fn is None:
-        raise ValueError(f"unknown VaR method '{method}'; "
-                         f"choose from {sorted(VAR_ESTIMATORS)}")
-
-    rows = []
-    t = window
-    while t + horizon <= len(r):
-        est = fn(r[max(0, t - window):t], alpha, horizon)
-        var_ret = est.get('var_return', float('nan'))
-        if np.isfinite(var_ret):
-            realised = float(math.expm1(np.sum(r[t:t + horizon])))
-            rows.append({'t': int(t), 'var_return': float(var_ret),
-                         'realised_return': realised,
-                         'exception': int(realised < var_ret)})
-        t += max(int(step), 1)
-
-    records = pd.DataFrame(rows)
-    if records.empty:
-        return {'method': method, 'alpha': alpha, 'horizon': horizon,
-                'n_eval': 0, 'exception_rate': float('nan'),
-                'avg_var_loss': float('nan'), 'mean_exceedance': float('nan'),
-                'kupiec': {}, 'independence': {}, 'conditional_coverage': {},
-                'records': records}
-
-    exc = records['exception'].values
-    breached = records[records['exception'] == 1]
-    # Reported as a POSITIVE magnitude: how much further than the threshold the
-    # loss went. A breach means realised < var_return (both negative), so the
-    # gap is `var_return - realised`.
-    mean_exceed = (float(np.mean(breached['var_return'].values
-                                 - breached['realised_return'].values))
-                   if len(breached) else 0.0)
-
-    return {
-        'method': method,
-        'alpha': float(alpha),
-        'horizon': int(horizon),
-        'n_eval': int(len(records)),
-        'exception_rate': float(np.mean(exc)),
-        'avg_var_loss': float(np.mean(-records['var_return'].values)),
-        'mean_exceedance': mean_exceed,
-        'kupiec': kupiec_pof_test(exc, alpha),
-        'independence': christoffersen_independence_test(exc),
-        'conditional_coverage': christoffersen_conditional_coverage(exc, alpha),
-        'records': records,
-    }
-
-
-def compare_var_methods(returns, methods=None, alpha=0.05, horizon=1,
-                        window=250, step=None):
-    """
-    Benchmark every VaR estimator on the same history (the book's Ch. 9 finale).
-
-    Runs :func:`backtest_var` per method and returns a single ranked table, so
-    the classical methods' drawbacks show up as numbers rather than as claims.
-    The expected pattern on equity data: variance-covariance under-reserves
-    (exception rate well above ``alpha``, Kupiec rejects), historical simulation
-    gets the rate roughly right but **fails independence** (clustered breaches,
-    because it is unconditional), and FHS passes both while being no wider than
-    it needs to be.
-
-    ``step`` defaults to ``horizon`` so the exception sequence is
-    non-overlapping — without that, multi-step breaches are mechanically
-    autocorrelated and the independence test rejects for the wrong reason.
-
-    Returns
-    -------
-    pd.DataFrame
-        One row per method, sorted so the best-calibrated (highest
-        conditional-coverage p-value) comes first.
-    """
-    methods = list(VAR_ESTIMATORS) if methods is None else list(methods)
-    step = horizon if step is None else step
-
-    rows = []
-    for m in methods:
-        try:
-            res = backtest_var(returns, method=m, alpha=alpha, horizon=horizon,
-                               window=window, step=step)
-        except Exception as exc:
-            print(f"compare_var_methods: '{m}' failed ({exc})")
-            continue
-        if not res['n_eval']:
-            continue
-        rows.append({
-            'method': m,
-            'n_eval': res['n_eval'],
-            'exception_rate': round(res['exception_rate'], 4),
-            'expected_rate': alpha,
-            'avg_var_loss': round(res['avg_var_loss'], 4),
-            'mean_exceedance': round(res['mean_exceedance'], 4),
-            'kupiec_p': round(res['kupiec'].get('p_value', float('nan')), 4),
-            'independence_p': round(
-                res['independence'].get('p_value', float('nan')), 4),
-            'cc_p': round(
-                res['conditional_coverage'].get('p_value', float('nan')), 4),
-            'clustered': res['independence'].get('clustering'),
-            'verdict': res['kupiec'].get('direction'),
-        })
-
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out = out.sort_values('cc_p', ascending=False,
-                              na_position='last').reset_index(drop=True)
-    return out
-
-
-# ==========================================
-# 8. Expected-Shortfall backtesting (Acerbi-Szekely)
-# ==========================================
-def acerbi_szekely_z2(records_realised, records_var, records_es, alpha=0.05):
-    """
-    Acerbi-Szekely **Z2** test of Expected Shortfall, conditional on exceedances.
-
-    Why this exists: every estimator in this module reports ``es_return``
-    alongside ``var_return``, and until now nothing validated it. That is exactly
-    the criticism this module was written to answer for VaR — reporting a risk
-    number without ever checking it — so leaving ES unchecked would have repeated
-    the mistake one level down.
-
-    ES is famously **not elicitable**, so it has no scoring function that can be
-    minimised the way a quantile loss pins down VaR. Acerbi & Szekely (2014)
-    sidestep that with a test conditional on the breaches actually observed::
-
-        Z2 = 1 - sum_t ( X_t * 1{X_t < VaR_t} ) / (N * alpha * mean ES)
-
-    Under a correctly specified model ``E[Z2] = 0``, and the sign carries the
-    whole message:
-
-    * ``Z2 < 0`` -> realised tail losses were **worse** than the ES predicted, so
-      the model **under-estimates severity**. This is the dangerous direction.
-    * ``Z2 > 0`` -> the tail was milder than forecast; the model is conservative.
-
-    Significance comes from a **bootstrap under the null**: the observed
-    exceedance severities are resampled with a Binomial(n, alpha) breach count to
-    build the distribution of Z2 a correctly-calibrated model would produce, so
-    the p-value needs no distributional assumption about returns. It is
-    one-sided — only under-estimation is a risk failure.
-
-    Parameters
-    ----------
-    records_realised, records_var, records_es : array-like
-        Aligned per-evaluation realised returns, VaR thresholds and ES estimates,
-        all as returns (losses negative — the sign convention used throughout
-        this module).
-    alpha : float, optional
-        Tail probability the VaR/ES were computed at. Default 0.05.
-
-    Returns
-    -------
-    dict
-        {'z2', 'n', 'n_exceptions', 'mean_realised_tail', 'mean_predicted_es',
-        'severity_ratio', 'p_value', 'reject_5pct', 'direction'} where
-        ``severity_ratio`` is realised tail loss / predicted ES (> 1 means the
-        model under-reserved).
-    """
-    x = np.asarray(records_realised, dtype=np.float64)
-    v = np.asarray(records_var, dtype=np.float64)
-    e = np.asarray(records_es, dtype=np.float64)
-    n = min(len(x), len(v), len(e))
-    out = {'z2': float('nan'), 'n': int(n), 'n_exceptions': 0,
-           'mean_realised_tail': float('nan'), 'mean_predicted_es': float('nan'),
-           'severity_ratio': float('nan'), 'p_value': float('nan'),
-           'reject_5pct': False, 'direction': 'n/a'}
-    if n < 20:
-        return out
-
-    x, v, e = x[:n], v[:n], e[:n]
-    ok = np.isfinite(x) & np.isfinite(v) & np.isfinite(e) & (e < 0)
-    if int(ok.sum()) < 20:
-        return out
-    x, v, e = x[ok], v[ok], e[ok]
-    n = len(x)
-    out['n'] = int(n)
-
-    breach = x < v
-    out['n_exceptions'] = int(breach.sum())
-    if out['n_exceptions'] == 0:
-        # No breaches at all means ES is untestable here, not perfect. Say so
-        # rather than returning a flattering zero.
-        out['direction'] = 'no exceptions - ES untestable'
-        return out
-
-    ratios = x[breach] / e[breach]
-    z2 = float(1.0 - float(np.sum(ratios)) / (n * alpha))
-    out['z2'] = z2
-    out['mean_realised_tail'] = float(np.mean(x[breach]))
-    out['mean_predicted_es'] = float(np.mean(e[breach]))
-    denom = float(np.mean(e[breach]))
-    out['severity_ratio'] = (float(np.mean(x[breach]) / denom)
-                             if denom != 0 else float('nan'))
-    out['direction'] = ('under-estimates severity' if z2 < 0
-                        else 'conservative' if z2 > 0 else 'ok')
-
-    # Bootstrap under H0. The subtle part: the null must describe a CORRECTLY
-    # calibrated model, so the resampled severities have to have mean 1
-    # (realised tail loss = predicted ES). Drawing them straight from the
-    # observed pool would bake the model's own mis-calibration into H0 — the
-    # null then centres on the observed failure and the test can never reject on
-    # severity, only on breach frequency, and with the sign backwards. So the
-    # pool is re-centred to unit mean, which imposes H0 while preserving the
-    # observed dispersion and shape. Breach count is Binomial(n, alpha), the
-    # correct null frequency, so the test still detects too-many/too-few breaches.
-    rng = np.random.default_rng(42)
-    mean_ratio = float(np.mean(ratios))
-    pool_h0 = ratios / mean_ratio if mean_ratio > 0 else ratios
-    sims = np.empty(2000, dtype=np.float64)
-    for i in range(len(sims)):
-        k = int(rng.binomial(n, alpha))
-        if k == 0:
-            sims[i] = 1.0
-            continue
-        draw = rng.choice(pool_h0, size=k, replace=True)
-        sims[i] = 1.0 - float(np.sum(draw)) / (n * alpha)
-    # One-sided: only a more negative Z2 (worse-than-promised tail) is a failure.
-    out['p_value'] = float(np.mean(sims <= z2))
-    out['reject_5pct'] = bool(out['p_value'] < 0.05)
-    return out
-
-
-def backtest_es(returns, method='fhs', alpha=0.05, horizon=1, window=250,
-                step=None, estimator=None):
-    """
-    Rolling out-of-sample **Expected Shortfall** backtest.
-
-    Mirrors :func:`backtest_var` — each estimate sees only past bars — but keeps
-    the per-step ES alongside the VaR and scores the pair with
-    :func:`acerbi_szekely_z2`. Run it whenever an ES number is going to be shown
-    to anyone: passing the VaR test says the breach *frequency* is right and says
-    nothing about whether the breaches were as bad as promised.
-
-    ``step`` defaults to ``horizon`` so the evaluations are non-overlapping.
-
-    Returns
-    -------
-    dict
-        The :func:`acerbi_szekely_z2` result plus 'method', 'alpha', 'horizon'
-        and the per-step 'records' DataFrame.
-    """
-    r = np.asarray(returns, dtype=np.float64)
-    r = r[np.isfinite(r)]
-    fn = estimator or VAR_ESTIMATORS.get(method)
-    if fn is None:
-        raise ValueError("unknown VaR method '%s'; choose from %s"
-                         % (method, sorted(VAR_ESTIMATORS)))
-    step = horizon if step is None else step
-
-    rows = []
-    t = window
-    while t + horizon <= len(r):
-        est = fn(r[max(0, t - window):t], alpha, horizon)
-        vr = est.get('var_return', float('nan'))
-        es = est.get('es_return', float('nan'))
-        if np.isfinite(vr) and np.isfinite(es):
-            realised = float(math.expm1(float(np.sum(r[t:t + horizon]))))
-            rows.append({'t': int(t), 'var_return': float(vr),
-                         'es_return': float(es), 'realised_return': realised,
-                         'exception': int(realised < vr)})
-        t += max(int(step), 1)
-
-    records = pd.DataFrame(rows)
-    if records.empty:
-        return {'method': method, 'alpha': float(alpha), 'horizon': int(horizon),
-                'n': 0, 'records': records}
-
-    res = acerbi_szekely_z2(records['realised_return'].values,
-                            records['var_return'].values,
-                            records['es_return'].values, alpha=alpha)
-    res.update({'method': method, 'alpha': float(alpha),
-                'horizon': int(horizon), 'records': records})
-    return res
-
-
-def compare_es_methods(returns, methods=None, alpha=0.05, horizon=1,
-                       window=250, step=None):
-    """
-    Benchmark every estimator's **Expected Shortfall**, ranked by |Z2|.
-
-    The ES counterpart of :func:`compare_var_methods`. Read the two tables
-    together: a method can pass Kupiec (right breach *frequency*) while failing
-    here (breaches far *worse* than promised), and that combination is precisely
-    the one that quietly under-reserves a portfolio.
-
-    Returns
-    -------
-    pd.DataFrame
-        One row per method, best-calibrated (smallest |Z2|) first.
-    """
-    methods = list(VAR_ESTIMATORS) if methods is None else list(methods)
-    rows = []
-    for m in methods:
-        try:
-            res = backtest_es(returns, method=m, alpha=alpha, horizon=horizon,
-                              window=window, step=step)
-        except Exception as exc:
-            print("compare_es_methods: '%s' failed (%s)" % (m, exc))
-            continue
-        if not res.get('n') or not res.get('n_exceptions'):
-            continue
-        rows.append({
-            'method': m,
-            'n_eval': res['n'],
-            'exceptions': res['n_exceptions'],
-            'realised_tail_%': round(res['mean_realised_tail'] * 100, 3),
-            'predicted_ES_%': round(res['mean_predicted_es'] * 100, 3),
-            'severity_ratio': round(res['severity_ratio'], 3),
-            'z2': round(res['z2'], 4),
-            'p_value': round(res['p_value'], 4),
-            'verdict': res['direction'],
-        })
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out = out.reindex(out['z2'].abs().sort_values().index)
-        out = out.reset_index(drop=True)
-    return out
+    return float(np.mean(a[mask] / p[mask] + np.log(p[mask])))
 ```
