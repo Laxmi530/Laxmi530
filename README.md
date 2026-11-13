@@ -9,540 +9,292 @@
   
 ```
 """
-Denoising autoencoder over price-feature windows -> a **regime-novelty** gate.
+The app's forecast charts, as plain functions of DataFrames (no Streamlit), so
+they can be tested directly (README section 70).
 
-Motivated by *Hands-On Deep Learning for Finance* (Troiano et al.), Chapter 4,
-"Index Replication by Autoencoders" (and its Chapter 1 warm-up), which builds a
-vanilla autoencoder and then explores the **denoising** and **sparse** variants.
-The book's application is index replication; this module repurposes the same
-machinery for the question this project actually needs answered.
+Two charts:
 
-Why an autoencoder here, and not as a feature transform
--------------------------------------------------------
-The tempting use of an autoencoder in a forecasting pipeline is dimensionality
-reduction: compress the feature window to a latent code and feed that to the
-predictor. This project has already run that experiment in a different guise and
-reported the result honestly — the market-context features and excess-return
-reframing both **hurt or did nothing** (README "Empirical findings"), because at
-a 5-day single-name horizon the first moment is a random walk and extra
-representation capacity is mostly extra overfitting surface. Adding a learned
-compression in front of a model that cannot beat a random walk would be more of
-the same, so latent features ship here as an available function
-(:func:`latent_codes`) rather than as a default in any model.
+* :func:`forecast_chart` - one model: recent history (a line, or candles
+  adjusted to the same basis as the forecast), a dashed "last close" marker,
+  the forecast's median path, its 95% range drawn as a cone that fans out from
+  the last close, and the random-walk reference.
+* :func:`comparison_chart` - every model at once: each one's median path, the
+  median of their paths, and the median of their 95% ranges, so agreement or
+  disagreement is visible at a glance.
 
-The genuinely useful application is the autoencoder's *other* property: an AE
-trained on one regime **reconstructs that regime well and anything else badly**.
-Reconstruction error is therefore a distribution-shift detector. That plugs
-straight into the part of this project that already carries the value — the
-serving gate. The app abstains when the data is degraded (``data_quality``) and
-when the walk-forward test says the model has no edge (``gating``); what it
-cannot currently see is *"today's market state is unlike anything this model was
-fitted on"*. A backtest-derived confidence bucket is a statement about the past
-regime; it says nothing about a novel present. That blind spot is exactly what
-this module closes.
-
-How it stays honest
--------------------
-* **Leak-free by construction.** The AE is fitted on the earliest block of
-  windows, its reference error distribution is measured on a *held-out* middle
-  block it never saw (in-sample errors are optimistically low and would
-  exaggerate every novelty score), and only then is the most recent window
-  scored. A caller inside a walk-forward backtest passes an origin-truncated
-  frame and gets a genuinely out-of-sample novelty read.
-* **Scale-free inputs.** Windows are built from ``compute_price_features``
-  (returns, MA ratios, volatilities, RSI, z-score, acceleration) and standardized
-  on training statistics only, so the score reflects *regime shape*, not the
-  price level — a ₹100 stock and a ₹4000 stock produce comparable numbers.
-* **Never fails a run.** TensorFlow is imported lazily and every failure path
-  returns a neutral report (``verdict='unknown'``, no gate action), so enabling
-  this can only ever add information.
+Both put trading sessions side by side: weekends, NSE holidays and (on hourly
+charts) the overnight gap are removed from the axis, so five forecast sessions
+sit evenly rather than bunched around a weekend. Daily charts hide the missing
+days; hourly charts give every bar its own slot on a category axis (README
+section 80).
 """
-
-import os
-import warnings
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 
-from model_utils import (
-    normalize_interval,
-    coerce_numeric_columns,
-    compute_price_features,
-    reset_keras_seeds,
-    default_keras_callbacks,
-)
+HISTORY = "#1f77b4"
+FORECAST = "#d62728"
+BAND = "rgba(214, 39, 40, 0.15)"
+NAIVE = "#7f7f7f"
+CONSENSUS = "#111111"
+#: Distinct colours for up to 20 models' lines; the history blue and the
+#: random-walk grey are left out so no model can be mistaken for either.
+MODEL_COLOURS = ["#ff7f0e", "#2ca02c", "#9467bd", "#8c564b", "#e377c2", "#17becf", "#bcbd22",
+                 "#d62728", "#ffbb78", "#98df8a", "#c5b0d5", "#c49c94", "#f7b6d2", "#9edae5",
+                 "#dbdb8d", "#393b79", "#637939", "#843c39", "#7b4173", "#e7ba52"]
 
-os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-
-# Window of bars compressed by the autoencoder. 20 bars (~1 month daily) is long
-# enough to carry a regime's shape and short enough that ~900 rows still yield
-# ~880 training windows.
-DEFAULT_WINDOW = 20
-# Rows below which the AE is not attempted (a network on a few dozen windows
-# would report noise as novelty).
-_MIN_ROWS = 260
-# Fractions of the window sequence used to fit / to measure the reference error.
-_FIT_FRAC, _REF_FRAC = 0.70, 0.20
-# Novelty percentile thresholds -> verdict.
-_UNUSUAL_PCT, _UNPRECEDENTED_PCT = 0.95, 0.995
-_EPS = 1e-12
-
-# Columns of compute_price_features the windows are built from. Column 0 is the
-# raw adjusted close: standardised on the earliest 70% of history, a stock that
-# has since trended carries a price far outside the fit range, and the AE then
-# scores the LEVEL as a novel regime. The other eight are scale-free.
-ALL_COLUMNS = tuple(range(9))
-SCALE_FREE_COLUMNS = tuple(range(1, 9))
+DATE_COLS = ("date", "datetime", "time", "ds")
+PRICE_COLS = ("adj close", "adj_close", "close", "price", "y")
+PRED_COLS = ("predicted_price", "prediction", "forecast", "yhat", "pred", "close")
 
 
-# ==========================================
-# 1. Architecture (vanilla / denoising / sparse)
-# ==========================================
-def build_autoencoder(input_dim, latent_dim=8, hidden=(64, 32), noise_std=0.1,
-                      l1_activity=0.0, dropout=0.0):
+def col(df, candidates):
+    """The first of ``candidates`` that is a column of ``df`` (case-insensitive)."""
+    lower = {str(c).lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in lower:
+            return lower[cand.lower()]
+    return None
+
+
+def is_hourly(interval):
+    s = str(interval).lower()
+    return "h" in s and "day" not in s
+
+
+def trading_gaps(dates):
+    """Calendar days with no bar between the first and last of ``dates`` (weekends, holidays)."""
+    d = pd.DatetimeIndex(pd.to_datetime(pd.Series(list(dates)))).normalize().unique()
+    if len(d) < 2:
+        return []
+    full = pd.date_range(d.min(), d.max(), freq="D")
+    return [x.strftime("%Y-%m-%d") for x in full.difference(d)]
+
+
+def _trading_axis(fig, dates, interval):
+    """Remove non-trading time from the x-axis so sessions sit side by side."""
+    if is_hourly(interval):
+        _bar_axis(fig)
+        return
+    gaps = trading_gaps(dates)
+    fig.update_xaxes(rangebreaks=[dict(values=gaps)] if gaps else [],
+                     rangeslider_visible=False, automargin=True, tickformat="%d-%b-%y")
+    fig.update_yaxes(automargin=True)
+
+
+def _bar_axis(fig, max_ticks=8):
     """
-    Build a symmetric autoencoder, optionally **denoising** and/or **sparse**.
+    Hourly charts: one evenly spaced slot per bar, labelled by date and time.
 
-    The three variants the book walks through, exposed as arguments on one
-    architecture rather than three near-duplicate builders:
-
-    * **Vanilla** (``noise_std=0``, ``l1_activity=0``) — plain bottleneck
-      reconstruction. On financial windows it will happily learn a near-identity
-      map if the bottleneck is generous, which makes it a poor novelty detector.
-    * **Denoising** (``noise_std>0``) — Gaussian noise is injected into the input
-      *during training only* (Keras ``GaussianNoise`` is a no-op at inference),
-      and the target is the clean input. The network must therefore learn the
-      data manifold rather than a copy operation, which is precisely what makes
-      the reconstruction error of an *off-manifold* (novel-regime) window large.
-      This is the default and the reason this module works at all.
-    * **Sparse** (``l1_activity>0``) — an L1 activity penalty on the latent layer
-      forces most codes toward zero, so each unit specialises. Useful when the
-      latent code is going to be *read* (interpretability) rather than only
-      scored.
-
-    Encoder: ``input -> [GaussianNoise] -> Dense(64) -> Dense(32) ->
-    Dense(latent, relu)``. Decoder mirrors it and ends in a linear layer, because
-    the standardized inputs are unbounded (a sigmoid output would clip the tails,
-    destroying exactly the extreme windows we want to flag).
-
-    Parameters
-    ----------
-    input_dim : int
-        Flattened window size (window * n_features).
-    latent_dim : int, optional
-        Bottleneck width. Default 8 — deliberately tight relative to a ~180-dim
-        input so the code cannot memorise.
-    hidden : tuple of int, optional
-        Encoder hidden widths (mirrored in the decoder). Default (64, 32).
-    noise_std : float, optional
-        Std of the training-time input corruption. Default 0.1.
-    l1_activity : float, optional
-        L1 penalty on the latent activations (sparse variant). Default 0.
-    dropout : float, optional
-        Dropout between encoder layers. Default 0.
-
-    Returns
-    -------
-    (tf.keras.Model, tf.keras.Model)
-        ``(autoencoder, encoder)`` — the encoder shares weights, for
-        :func:`latent_codes`.
+    The axis used to be a date axis with Plotly rangebreaks hiding the night
+    (an hour-pattern break, 15:30-09:15) and the weekends (day values). With
+    both, Plotly mapped whole sessions to the wrong place: the history line ran
+    back across the chart and dates bunched together (README section 80). A
+    category axis has no hidden time to get wrong: every bar takes one slot,
+    in order, so sessions sit side by side by construction.
     """
-    import tensorflow as tf
-    from tensorflow.keras import layers, Model, Input, regularizers
+    def ts(x):
+        return pd.Timestamp(x)
 
-    inputs = Input(shape=(input_dim,))
-    x = inputs
-    if noise_std and noise_std > 0:
-        x = layers.GaussianNoise(noise_std)(x)
-    for h in hidden:
-        x = layers.Dense(h, activation='relu')(x)
-        if dropout:
-            x = layers.Dropout(dropout)(x)
+    xs = set()
+    for t in fig.data:
+        xs.update(ts(x) for x in (t.x if t.x is not None else []))
+    for s in fig.layout.shapes:
+        xs.update((ts(s.x0), ts(s.x1)))
+    for a in fig.layout.annotations:
+        if a.x is not None:
+            xs.add(ts(a.x))
+    xs = sorted(xs)
+    fmt = "%d-%b %H:%M"
+    if len({x.strftime(fmt) for x in xs}) < len(xs):
+        fmt = "%d-%b-%y %H:%M"            # the window crosses a year
+    label = {x: x.strftime(fmt) for x in xs}
+    for t in fig.data:
+        if t.x is not None:
+            t.x = [label[ts(x)] for x in t.x]
+    for s in fig.layout.shapes:
+        s.x0, s.x1 = label[ts(s.x0)], label[ts(s.x1)]
+    for a in fig.layout.annotations:
+        if a.x is not None:
+            a.x = label[ts(a.x)]
+    # A tick at the first bar of each session, thinned to about max_ticks.
+    starts = [x for i, x in enumerate(xs) if i == 0 or x.normalize() != xs[i - 1].normalize()]
+    step = max(1, -(-len(starts) // max_ticks))
+    ticks = starts[::step]
+    fig.update_xaxes(type="category", categoryorder="array", categoryarray=[label[x] for x in xs],
+                     tickmode="array", tickvals=[label[x] for x in ticks],
+                     ticktext=[x.strftime("%d-%b %H:%M") for x in ticks],
+                     rangeslider_visible=False, automargin=True)
+    fig.update_yaxes(automargin=True)
 
-    reg = regularizers.l1(l1_activity) if l1_activity else None
-    latent = layers.Dense(latent_dim, activation='relu',
-                          activity_regularizer=reg, name='latent')(x)
 
-    y = latent
-    for h in reversed(hidden):
-        y = layers.Dense(h, activation='relu')(y)
-    outputs = layers.Dense(input_dim, activation='linear')(y)
+def adjusted_ohlc(hist):
+    """
+    Open/high/low/close scaled by ``adj_close / close``, so candles sit on the
+    same dividend- and split-adjusted basis as the forecast. None when the
+    frame has no OHLC.
+    """
+    o, h, l, c = (col(hist, [k]) for k in ("open", "high", "low", "close"))
+    adj = col(hist, ["adj close", "adj_close"])
+    if not all((o, h, l, c)):
+        return None
+    close = pd.to_numeric(hist[c], errors="coerce")
+    ratio = (pd.to_numeric(hist[adj], errors="coerce") / close) if adj else 1.0
+    ratio = ratio.where(np.isfinite(ratio) & (ratio > 0), 1.0) if adj else 1.0
+    return pd.DataFrame({k: pd.to_numeric(hist[v], errors="coerce") * ratio
+                         for k, v in (("open", o), ("high", h), ("low", l), ("close", c))})
 
-    autoencoder = Model(inputs, outputs, name='denoising_autoencoder')
-    autoencoder.compile(
-        loss='mse',
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3, clipnorm=1.0),
+
+def _history_trace(sub, date_col, price_col, style, name="History"):
+    if style == "candles":
+        ohlc = adjusted_ohlc(sub)
+        if ohlc is not None and ohlc.notna().all(axis=1).any():
+            return go.Candlestick(x=sub[date_col], open=ohlc["open"], high=ohlc["high"],
+                                  low=ohlc["low"], close=ohlc["close"], name=name,
+                                  increasing_line_color="#2ca02c", decreasing_line_color="#d62728",
+                                  showlegend=True)
+    return go.Scatter(x=sub[date_col], y=sub[price_col], mode="lines", name=name,
+                      line=dict(color=HISTORY, width=2),
+                      hovertemplate="Close ₹%{y:,.2f}<extra></extra>")
+
+
+def _last_close_marker(fig, x):
+    fig.add_shape(type="line", x0=x, x1=x, y0=0, y1=1, yref="paper",
+                  line=dict(color="#9a9a9a", width=1, dash="dash"))
+    fig.add_annotation(x=x, y=1, yref="paper", text="last close", showarrow=False,
+                       yanchor="bottom", font=dict(size=10, color="#6b6b6b"))
+
+
+def _layout(fig, title, legend_rows=1):
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=14)),
+        yaxis_title="Price (₹)",
+        template="plotly_white",
+        hovermode="x unified",
+        showlegend=True,
+        height=460 + 22 * max(0, legend_rows - 1),
+        # Legend in a row BELOW the plot: overlaid, it covered the most recent
+        # prices on a narrow screen (README section 66).
+        legend=dict(orientation="h", x=0, xanchor="left", y=-0.14, yanchor="top"),
+        margin=dict(l=10, r=10, t=40, b=10),
+        xaxis_rangeslider_visible=False,
     )
-    encoder = Model(inputs, latent, name='encoder')
-    return autoencoder, encoder
 
 
-# ==========================================
-# 2. Window construction
-# ==========================================
-def feature_windows(df, window=DEFAULT_WINDOW, columns=SCALE_FREE_COLUMNS):
+def _history(original_df, lookback):
+    d, p = col(original_df, DATE_COLS), col(original_df, PRICE_COLS)
+    if not (d and p):
+        raise ValueError(f"no date/price columns in the history: {list(original_df.columns)}")
+    sub = original_df.tail(min(lookback, len(original_df))).copy()
+    sub[d] = pd.to_datetime(sub[d])
+    return sub, d, p
+
+
+def forecast_chart(original_df, prediction_df, company_name, interval, lookback=50, style="line"):
     """
-    Build flattened, scale-free feature windows from a raw stock frame.
+    One model's forecast: history, last-close marker, median path, the 95%
+    range as a cone from the last close, and the random-walk reference.
 
-    Reuses ``compute_price_features`` — the matrix the sequence models train
-    on — so the autoencoder's notion of "market state" is the one the rest of
-    the project already uses, minus its raw price column (see
-    :data:`SCALE_FREE_COLUMNS`). The first 30 rows are dropped because
-    the long rolling windows are incomplete there (matching
-    ``prepare_feature_sequences``), and each window is flattened so a dense
-    autoencoder can consume it.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Raw stock DataFrame with 'datetime' and 'adj_close'.
-    window : int, optional
-        Bars per window. Default 20.
-    columns : tuple of int, optional
-        Columns of ``compute_price_features`` to use. Default the eight
-        scale-free ones; :data:`ALL_COLUMNS` restores the raw price.
-
-    Returns
-    -------
-    (np.ndarray, np.ndarray, int)
-        ``(X, timestamps, n_features)`` where ``X`` has shape
-        (n_windows, window * n_features) and ``timestamps[i]`` is the last bar of
-        window ``i``. Returns empty arrays when there is too little history.
+    Raises ValueError when the date or price columns cannot be found.
     """
-    d = df.copy()
-    d['datetime'] = pd.to_datetime(d['datetime'])
-    d = d.set_index('datetime').sort_index()
-    coerce_numeric_columns(d)
+    sub, dh, ph = _history(original_df, lookback)
+    dp, pp = col(prediction_df, DATE_COLS), col(prediction_df, PRED_COLS)
+    if not (dp and pp):
+        raise ValueError(f"no date/forecast columns in the prediction: {list(prediction_df.columns)}")
+    last_x, last_y = sub[dh].iloc[-1], float(sub[ph].iloc[-1])
+    fx = [last_x] + list(pd.to_datetime(prediction_df[dp]))
+    fy = [last_y] + [float(v) for v in prediction_df[pp]]
 
-    prices = d['adj_close'].dropna()
-    if len(prices) < window + 40:
-        return np.array([]), np.array([]), 0
+    fig = go.Figure()
+    fig.add_trace(_history_trace(sub, dh, ph, style))
+    lo, hi = col(prediction_df, ["lower_bound", "lower"]), col(prediction_df, ["upper_bound", "upper"])
+    if lo and hi:
+        # The cone starts at the last close with zero width and fans out: the
+        # widening IS the message. It used to start at full width on day one.
+        upper = [last_y] + [float(v) for v in prediction_df[hi]]
+        lower = [last_y] + [float(v) for v in prediction_df[lo]]
+        fig.add_trace(go.Scatter(x=fx, y=upper, mode="lines", line=dict(width=0),
+                                 showlegend=False, hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=fx, y=lower, mode="lines", line=dict(width=0), fill="tonexty",
+                                 fillcolor=BAND, name="95% range", customdata=upper,
+                                 hovertemplate="95% range ₹%{y:,.2f} – ₹%{customdata:,.2f}<extra></extra>"))
+    # The random walk: the price staying where it is, the no-skill reference.
+    fig.add_trace(go.Scatter(x=fx, y=[last_y] * len(fx), mode="lines", name="Random walk (no change)",
+                             line=dict(color=NAIVE, width=1.5, dash="dot"),
+                             hovertemplate="No change ₹%{y:,.2f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=fx, y=fy, mode="lines+markers", name="Forecast (median)",
+                             line=dict(color=FORECAST, width=2, dash="dash"),
+                             marker=dict(symbol="x", size=8),
+                             hovertemplate="Forecast ₹%{y:,.2f}<extra></extra>"))
+    _last_close_marker(fig, last_x)
+    _layout(fig, f"{company_name} · {str(interval).lower()} bars")
+    _trading_axis(fig, list(sub[dh]) + fx, interval)
+    return fig
 
-    idx = prices.index
-    feats = compute_price_features(prices.values.astype(np.float64))
-    feats = feats[:, list(columns)]
-    # Drop the rolling-window warmup rows (30 = the long SMA/vol window).
-    feats, idx = feats[30:], idx[30:]
-    n_features = feats.shape[1]
 
-    n_win = len(feats) - window + 1
-    if n_win < 40:
-        return np.array([]), np.array([]), n_features
-
-    X = np.stack([feats[i:i + window].reshape(-1) for i in range(n_win)])
-    stamps = np.asarray(idx[window - 1:])
-    return X.astype(np.float64), stamps, n_features
-
-
-# ==========================================
-# 3. Fit + score
-# ==========================================
-def fit_regime_autoencoder(df, interval='1d', window=DEFAULT_WINDOW,
-                           latent_dim=8, noise_std=0.1, l1_activity=0.0,
-                           epochs=150, batch_size=32, verbose=False,
-                           columns=SCALE_FREE_COLUMNS):
+def comparison_chart(model_results, company_name, interval, lookback=30, style="line"):
     """
-    Fit the denoising AE and measure its held-out reconstruction-error baseline.
-
-    Three temporal blocks, in order, with no shuffling across them:
-
-    1. **Fit block** (earliest 70% of windows) — trains the AE. The scaler's
-       mean/std come from this block only.
-    2. **Reference block** (next 20%) — never trained on. Its reconstruction
-       errors form the baseline distribution that every later score is compared
-       against. Using in-sample errors here would be the classic mistake: they
-       are systematically too small, so *everything* subsequent would look novel.
-    3. **Score block** (final 10%, plus whatever the caller scores later) — the
-       recent windows whose novelty we actually care about.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Raw stock DataFrame with 'datetime' and 'adj_close'.
-    interval : str, optional
-        '1d'/'daily' or '1h'/'hourly' (recorded in the result; the window is in
-        bars either way).
-    window : int, optional
-        Bars per window. Default 20.
-    latent_dim : int, optional
-        Bottleneck width. Default 8.
-    noise_std : float, optional
-        Denoising corruption level. Default 0.1 (0 = vanilla AE).
-    l1_activity : float, optional
-        Latent L1 penalty (sparse AE). Default 0.
-    epochs, batch_size : int, optional
-        Training budget. Defaults 150 / 32 (early stopping usually fires first).
-    verbose : bool, optional
-        Print the Keras training log. Default False.
-
-    Returns
-    -------
-    dict or None
-        A bundle with keys ``autoencoder``, ``encoder``, ``mu``, ``sd``,
-        ``window``, ``n_features``, ``ref_errors`` (the held-out baseline),
-        ``score_errors`` / ``score_stamps`` (the recent block), and
-        ``ref_quantiles``. Returns None when there is too little history or
-        TensorFlow is unavailable.
+    Every model's median path from the last close, their median path, and the
+    median of their 95% ranges. ``model_results`` maps a model's name to
+    ``{'history': DataFrame, 'prediction': DataFrame}``. None when no model has
+    a usable forecast.
     """
-    interval = normalize_interval(interval)
-    X, stamps, n_features = feature_windows(df, window=window, columns=columns)
-    if len(X) == 0 or len(X) < _MIN_ROWS // 4:
-        print(f"autoencoder_regime: only {len(X)} windows — skipping the AE.")
+    paths, lowers, uppers = {}, [], []
+    hist = None
+    for name, data in model_results.items():
+        pred = data.get("prediction")
+        if hist is None and data.get("history") is not None:
+            hist = data["history"]
+        if pred is None or not len(pred):
+            continue
+        dp, pp = col(pred, DATE_COLS), col(pred, PRED_COLS)
+        if not (dp and pp):
+            continue
+        paths[name] = (list(pd.to_datetime(pred[dp])), [float(v) for v in pred[pp]])
+        lo, hi = col(pred, ["lower_bound", "lower"]), col(pred, ["upper_bound", "upper"])
+        if lo and hi:
+            lowers.append([float(v) for v in pred[lo]])
+            uppers.append([float(v) for v in pred[hi]])
+    if hist is None or not paths:
         return None
+    sub, dh, ph = _history(hist, lookback)
+    last_x, last_y = sub[dh].iloc[-1], float(sub[ph].iloc[-1])
+    horizon = min(len(p[1]) for p in paths.values())
+    dates = [last_x] + next(iter(paths.values()))[0][:horizon]
 
-    n = len(X)
-    n_fit = int(n * _FIT_FRAC)
-    n_ref = max(20, int(n * _REF_FRAC))
-    n_fit = min(n_fit, n - n_ref - 5)
-    if n_fit < 60:
-        print("autoencoder_regime: too few fit windows — skipping the AE.")
-        return None
-
-    fit_block = X[:n_fit]
-    ref_block = X[n_fit:n_fit + n_ref]
-    score_block = X[n_fit + n_ref:]
-    score_stamps = stamps[n_fit + n_ref:]
-
-    mu = fit_block.mean(axis=0)
-    sd = fit_block.std(axis=0)
-    sd = np.where(sd < 1e-8, 1.0, sd)
-
-    def _scale(a):
-        return (a - mu) / sd
-
-    try:
-        reset_keras_seeds()
-        ae, enc = build_autoencoder(
-            X.shape[1], latent_dim=latent_dim, noise_std=noise_std,
-            l1_activity=l1_activity,
-        )
-        Z = _scale(fit_block)
-        # Last 10% of the fit block is the Keras validation split for early
-        # stopping — temporally the most recent part of the fit block, so the
-        # stopping signal is not measured on windows the AE has already memorised
-        # from an earlier era.
-        val = max(1, int(len(Z) * 0.1))
-        ae.fit(Z[:-val], Z[:-val],
-               validation_data=(Z[-val:], Z[-val:]),
-               epochs=epochs, batch_size=batch_size, shuffle=True,
-               callbacks=default_keras_callbacks(patience=12, lr_patience=6),
-               verbose=1 if verbose else 0)
-    except Exception as exc:
-        print(f"autoencoder_regime: AE fit failed ({exc}); novelty unavailable.")
-        return None
-
-    ref_errors = reconstruction_error(ae, _scale(ref_block))
-    score_errors = (reconstruction_error(ae, _scale(score_block))
-                    if len(score_block) else np.array([]))
-
-    if len(ref_errors):
-        q = np.quantile(ref_errors, [0.5, 0.9, 0.95, 0.99])
-        ref_q = dict(zip(['p50', 'p90', 'p95', 'p99'], [float(v) for v in q]))
-        print(f"autoencoder_regime: AE fitted on {len(fit_block)} windows; "
-              f"held-out error median {ref_q['p50']:.4f} (p95 {ref_q['p95']:.4f})")
-    else:
-        ref_q = {}
-        print("autoencoder_regime: AE fitted (no reference block available)")
-
-    return {
-        'autoencoder': ae,
-        'encoder': enc,
-        'mu': mu,
-        'sd': sd,
-        'window': int(window),
-        'columns': tuple(columns),
-        'interval': interval,
-        'n_features': int(n_features),
-        'n_fit': int(len(fit_block)),
-        'ref_errors': ref_errors,
-        'ref_quantiles': ref_q,
-        'score_errors': score_errors,
-        'score_stamps': score_stamps,
-    }
-
-
-def reconstruction_error(autoencoder, X_scaled):
-    """
-    Per-window mean squared reconstruction error.
-
-    The novelty score itself. Mean (not sum) so it is comparable across window
-    sizes, and per-window (not pooled) so a caller can plot it as a time series
-    and see *when* the regime drifted.
-    """
-    if len(X_scaled) == 0:
-        return np.array([])
-    recon = np.asarray(autoencoder.predict(X_scaled, verbose=0))
-    return np.mean((np.asarray(X_scaled) - recon) ** 2, axis=1)
-
-
-def latent_codes(bundle, df=None, X=None):
-    """
-    Encode windows into the AE's latent space.
-
-    Provided for experimentation — compressed regime codes are a legitimate
-    feature set for a *cross-sectional* or regime-conditioned model. It is
-    deliberately **not** wired into any forecaster here: this project's own A/B
-    evidence is that extra representation capacity does not improve single-name
-    absolute-price forecasts at these horizons, and shipping an unvalidated
-    feature transform would contradict that finding.
-
-    Parameters
-    ----------
-    bundle : dict
-        Output of :func:`fit_regime_autoencoder`.
-    df : pd.DataFrame, optional
-        Frame to encode (windows are rebuilt with the bundle's window size).
-    X : np.ndarray, optional
-        Pre-built unscaled windows, used instead of ``df`` when given.
-
-    Returns
-    -------
-    np.ndarray
-        (n_windows, latent_dim) codes; empty if nothing could be encoded.
-    """
-    if bundle is None:
-        return np.array([])
-    if X is None:
-        if df is None:
-            return np.array([])
-        X, _, _ = feature_windows(df, window=bundle['window'],
-                                  columns=bundle.get('columns', SCALE_FREE_COLUMNS))
-    if len(X) == 0:
-        return np.array([])
-    Z = (X - bundle['mu']) / bundle['sd']
-    return np.asarray(bundle['encoder'].predict(Z, verbose=0))
-
-
-# ==========================================
-# 4. The gate-facing report
-# ==========================================
-def regime_novelty(df, interval='1d', window=DEFAULT_WINDOW, bundle=None,
-                   **fit_kwargs):
-    """
-    Score how unlike its training history the **latest** market window is.
-
-    This is the function the serving layer calls. It fits (or reuses) the AE,
-    reconstructs the most recent window, and expresses the error as a percentile
-    of the held-out reference distribution:
-
-    * ``< 95th`` -> ``'familiar'`` — the current regime looks like what the
-      models were fitted on; the usual confidence machinery applies.
-    * ``95th-99.5th`` -> ``'unusual'`` — a caller should widen the cone and treat
-      the directional call with extra suspicion.
-    * ``> 99.5th`` -> ``'unprecedented'`` — the state is off-manifold. Every
-      model's backtest-derived confidence bucket is an extrapolation here, so the
-      honest action is to withhold the directional call and show the risk cone
-      only (see ``gating.apply_novelty_gate``).
-
-    ``cone_multiplier`` is a modest, bounded suggestion (1.0-1.5) for scaling an
-    uncertainty band, derived from the error ratio. It is intentionally *not*
-    applied automatically anywhere: the HAR-RV/Vol-LSTM cones are conformally
-    calibrated, and silently multiplying a calibrated interval by an
-    uncalibrated factor would break the very guarantee that makes it useful.
-    Treat it as a research knob to A/B, in the same spirit as the India-VIX tilt.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Raw stock DataFrame with 'datetime' and 'adj_close'.
-    interval : str, optional
-        '1d'/'daily' or '1h'/'hourly'.
-    window : int, optional
-        Bars per window. Default 20.
-    bundle : dict, optional
-        A previously fitted bundle from :func:`fit_regime_autoencoder`, to avoid
-        refitting (e.g. across several models in one request).
-    **fit_kwargs
-        Forwarded to :func:`fit_regime_autoencoder`.
-
-    Returns
-    -------
-    dict
-        {'available', 'verdict', 'error', 'percentile', 'ratio_to_p50',
-         'cone_multiplier', 'reference', 'asof', 'note'}. On any failure:
-        ``available=False``, ``verdict='unknown'`` and a populated ``note`` —
-        never an exception.
-    """
-    neutral = {'available': False, 'verdict': 'unknown', 'error': float('nan'),
-               'percentile': float('nan'), 'ratio_to_p50': float('nan'),
-               'cone_multiplier': 1.0, 'reference': {}, 'asof': None, 'note': ''}
-
-    try:
-        if bundle is None:
-            bundle = fit_regime_autoencoder(df, interval=interval,
-                                            window=window, **fit_kwargs)
-        if bundle is None:
-            return {**neutral, 'note': 'insufficient history for the autoencoder'}
-
-        X, stamps, _ = feature_windows(
-            df, window=bundle['window'],
-            columns=bundle.get('columns', SCALE_FREE_COLUMNS))
-        if len(X) == 0:
-            return {**neutral, 'note': 'no usable feature windows'}
-
-        Z = (X[-1:] - bundle['mu']) / bundle['sd']
-        err = float(reconstruction_error(bundle['autoencoder'], Z)[0])
-
-        ref = np.asarray(bundle['ref_errors'], dtype=np.float64)
-        if len(ref) < 10:
-            return {**neutral, 'error': err,
-                    'note': 'reference error distribution too small'}
-
-        pct = float(np.mean(ref <= err))
-        p50 = float(np.median(ref))
-        ratio = float(err / p50) if p50 > _EPS else float('nan')
-
-        if pct > _UNPRECEDENTED_PCT:
-            verdict = 'unprecedented'
-        elif pct > _UNUSUAL_PCT:
-            verdict = 'unusual'
-        else:
-            verdict = 'familiar'
-
-        # Bounded widening suggestion: sqrt of the error ratio (errors are in
-        # squared units, bands are in sigma units), clipped to [1.0, 1.5] so a
-        # single freak window can never blow the cone up.
-        mult = 1.0
-        if np.isfinite(ratio) and ratio > 1.0:
-            mult = float(np.clip(np.sqrt(ratio), 1.0, 1.5))
-
-        return {
-            'available': True,
-            'verdict': verdict,
-            'error': err,
-            'percentile': round(pct, 4),
-            'ratio_to_p50': round(ratio, 3) if np.isfinite(ratio) else float('nan'),
-            'cone_multiplier': round(mult, 3),
-            'reference': bundle.get('ref_quantiles', {}),
-            'asof': (pd.Timestamp(stamps[-1]).isoformat()
-                     if len(stamps) else None),
-            'note': '',
-        }
-    except Exception as exc:                     # novelty is advisory, never fatal
-        return {**neutral, 'note': f'novelty check failed: {str(exc)[:120]}'}
-
-
-def novelty_series(bundle):
-    """
-    The recent-block novelty scores as a tidy time series, for plotting.
-
-    Returns the held-out *score block* errors alongside their timestamps and the
-    reference percentile of each, so a caller can show "when did this stock's
-    regime drift?" rather than only the latest scalar.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns ['datetime', 'error', 'percentile'] (empty if unavailable).
-    """
-    if not bundle or len(bundle.get('score_errors', [])) == 0:
-        return pd.DataFrame(columns=['datetime', 'error', 'percentile'])
-    ref = np.asarray(bundle['ref_errors'], dtype=np.float64)
-    errs = np.asarray(bundle['score_errors'], dtype=np.float64)
-    pct = ([float(np.mean(ref <= e)) for e in errs] if len(ref) >= 10
-           else [float('nan')] * len(errs))
-    return pd.DataFrame({'datetime': pd.to_datetime(bundle['score_stamps']),
-                         'error': errs, 'percentile': pct})
+    fig = go.Figure()
+    fig.add_trace(_history_trace(sub, dh, ph, style))
+    if lowers:
+        lo = np.median(np.array([v[:horizon] for v in lowers]), axis=0)
+        hi = np.median(np.array([v[:horizon] for v in uppers]), axis=0)
+        up = [last_y] + list(hi)
+        fig.add_trace(go.Scatter(x=dates, y=up, mode="lines", line=dict(width=0),
+                                 showlegend=False, hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=dates, y=[last_y] + list(lo), mode="lines", line=dict(width=0),
+                                 fill="tonexty", fillcolor="rgba(120, 120, 120, 0.15)",
+                                 name=f"Median 95% range ({len(lowers)} models)", customdata=up,
+                                 hovertemplate="Median range ₹%{y:,.2f} – ₹%{customdata:,.2f}<extra></extra>"))
+    # One legend entry for all the model lines: one entry each made a 24-row
+    # legend on a phone. Hover still names every model and its value.
+    for i, (name, (_, ys)) in enumerate(paths.items()):
+        fig.add_trace(go.Scatter(x=dates, y=[last_y] + ys[:horizon], mode="lines", name=name,
+                                 legendgroup="models", showlegend=(i == 0),
+                                 legendgrouptitle=None,
+                                 line=dict(color=MODEL_COLOURS[i % len(MODEL_COLOURS)], width=1.3),
+                                 opacity=0.85, hovertemplate=f"{name} ₹%{{y:,.2f}}<extra></extra>"))
+    first = next(t for t in fig.data if getattr(t, "legendgroup", None) == "models")
+    first.name = f"Each model ({len(paths)}, hover for names)"
+    first.hovertemplate = f"{next(iter(paths))} ₹%{{y:,.2f}}<extra></extra>"
+    med = np.median(np.array([ys[:horizon] for _, ys in paths.values()]), axis=0)
+    fig.add_trace(go.Scatter(x=dates, y=[last_y] + list(med), mode="lines+markers",
+                             name="Median of the models", line=dict(color=CONSENSUS, width=3),
+                             marker=dict(size=6), hovertemplate="Median ₹%{y:,.2f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=dates, y=[last_y] * len(dates), mode="lines", name="Random walk (no change)",
+                             line=dict(color=NAIVE, width=1.5, dash="dot"),
+                             hovertemplate="No change ₹%{y:,.2f}<extra></extra>"))
+    _last_close_marker(fig, last_x)
+    _layout(fig, f"{company_name} · all {len(paths)} models", legend_rows=2)
+    _trading_axis(fig, list(sub[dh]) + dates, interval)
+    return fig
 ```
