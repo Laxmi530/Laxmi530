@@ -8,272 +8,258 @@
 - Code
   
 ```
-"""
-Declarative neural-network architectures, and the record of what was built.
+import pandas as pd
+import numpy as np
+import pmdarima as pm
+import warnings
 
-Why this module exists
-----------------------
-This project ships an auditable per-run manifest (``reproducibility.run_manifest``)
-carrying the seed, package versions and request parameters — and it did **not**
-carry the network shape. That is a hole in a reproducibility claim: pinning the
-seed reproduces a fit only if the architecture is also fixed, and the layer
-stacks lived as literals inside ``DL_model.py``, ``CNN_LSTM_model.py`` and
-``vol_lstm_model.py``. Edit a hidden size, and every prior manifest silently
-describes a model that no longer exists while still claiming to be complete.
+from model_utils import (
+    N_SIMS as _N_SIMS,
+    normalize_interval,
+    prepare_log_returns,
+    winsorize,
+    select_best_garch,
+    simulate_price_paths,
+    generate_future_dates,
+)
 
-Two mechanisms, with deliberately different jobs
-------------------------------------------------
-1. :data:`SPECS` — the **declared** architecture per model, JSON-serialisable
-   and overridable from a file. These genuinely drive the builders that accept
-   them, so changing a spec changes the network without touching model code.
-2. :func:`describe` — the **realised** architecture, read back off the compiled
-   Keras object: layer types, output shapes, parameter counts, optimizer, loss.
-
-The manifest records the realised one, and that choice matters. A declared spec
-that is merely *stored* alongside a run is decoration — the same "configuration
-theatre" ``config.py``'s tests exist to prevent. Introspection cannot drift from
-what actually ran, and it covers models whose builders are not spec-driven,
-which is why it is the authoritative record rather than the convenient one.
-
-Honest scope
-------------
-Spec-driven today: **DL (LSTM/GRU)**, **CNN-LSTM**, **Vol-LSTM** — the three whose
-builders take their layer sizes as arguments. N-BEATS, TCN and the Transformer
-are **introspection-only**: their shapes are recorded faithfully but not yet
-controlled from here. Wiring those is mechanical follow-up work, and the
-distinction is reported by :func:`spec_driven` rather than glossed over.
-
-Overriding
-----------
-Drop an ``architectures.json`` next to this file (or point ``STOCKAPP_ARCH_FILE``
-at one) containing any subset of :data:`SPECS`; matching keys are merged over the
-defaults. An override is reported in the console banner and in the manifest,
-because a run on a non-default architecture is not the shipped configuration.
-"""
-
-import copy
-import hashlib
-import json
-import os
-
-import config as _cfg
-
-# Models whose builders read their layer sizes from SPECS. Everything else is
-# recorded by introspection only — see the module docstring.
-SPEC_DRIVEN = ("DL", "CNN-LSTM", "Vol-LSTM")
-
-ARCH_FILE_ENV = _cfg.ENV_PREFIX + "ARCH_FILE"
-DEFAULT_ARCH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 "architectures.json")
-
-# -----------------------------------------------------------------------------
-# Declared architectures
-# -----------------------------------------------------------------------------
-# Values match the literals these models shipped with, so introducing this module
-# changes no forecast. Verified by tests/test_architectures.py, which asserts the
-# defaults reproduce the previous layer stacks exactly.
-_DEFAULT_SPECS = {
-    "DL": {
-        "description": "Stacked LSTM/GRU, direct multi-horizon (DL_model.py)",
-        "recurrent_units": [64, 64, 32],
-        "recurrent_dropout": 0.1,
-        "dropout": [0.3, 0.3, 0.2],
-        "dense_units": 16,
-        "dense_activation": "relu",
-    },
-    "CNN-LSTM": {
-        "description": "Causal Conv1D -> pool -> stacked LSTM (CNN_LSTM_model.py)",
-        "filters": [32, 64],
-        "kernel_size": 3,
-        "pool_size": 2,
-        "lstm_units": [48, 24],
-        "dropout": 0.2,
-    },
-    "Vol-LSTM": {
-        "description": "Stacked LSTM over RV channels (vol_lstm_model.py)",
-        "units": [48, 24],
-        "dropout": 0.2,
-    },
-}
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 
-def _load_overrides():
-    """Read the optional JSON override file; never raise on a bad file."""
-    path = os.environ.get(ARCH_FILE_ENV) or DEFAULT_ARCH_FILE
-    if not os.path.exists(path):
-        return {}, None
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return (data if isinstance(data, dict) else {}), path
-    except Exception:
-        # A malformed architecture file must not stop the app; it should simply
-        # fail to take effect, exactly as a malformed feature flag does.
-        return {}, None
-
-
-def _build_specs():
-    specs = copy.deepcopy(_DEFAULT_SPECS)
-    overrides, path = _load_overrides()
-    applied = []
-    for name, patch in overrides.items():
-        if name in specs and isinstance(patch, dict):
-            specs[name].update(patch)
-            applied.append(name)
-    return specs, sorted(applied), path
-
-
-SPECS, OVERRIDDEN, ARCH_FILE = _build_specs()
-
-
-def spec(name):
-    """Return a copy of one model's declared spec ({} if unknown)."""
-    return copy.deepcopy(SPECS.get(name, {}))
-
-
-def spec_driven(name):
-    """Whether ``name``'s builder actually reads its shape from :data:`SPECS`."""
-    return name in SPEC_DRIVEN
-
-
-def fingerprint(obj):
+# ==========================================
+# 1. Preprocessing (Stationarity + Cleaning)
+# ==========================================
+def prepare_data_statistical(df, max_obs=None):
     """
-    Short, stable hash of any JSON-serialisable object.
+    Prepare data for ARIMA/GARCH: compute log returns and clean outliers.
 
-    Lets the manifest carry an architecture identity in one short token, so two
-    runs can be compared for "same network?" without diffing nested dicts.
-    Sorted keys make it order-independent.
+    ARIMA/GARCH work best on returns, not raw prices. Applies winsorization
+    at 1st/99th percentiles for robustness and optionally limits to recent
+    observations.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with 'datetime' and OHLCV columns including 'adj_close'.
+    max_obs : int, optional
+        Maximum number of recent observations to keep. If None, use all data.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with datetime index, log_return column, and winsorized values.
     """
-    try:
-        blob = json.dumps(obj, sort_keys=True, default=str)
-    except Exception:
-        blob = repr(obj)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+    df = prepare_log_returns(df, max_obs=max_obs)
+    df['log_return'] = winsorize(df['log_return'].values)
+    return df
 
 
-# -----------------------------------------------------------------------------
-# Realised architecture (introspection)
-# -----------------------------------------------------------------------------
-def describe(model, name=None):
+# ==========================================
+# 2. Train Hybrid ARIMA-GARCH
+# ==========================================
+def train_arima_garch(df):
     """
-    Read the architecture back off a compiled Keras model.
+    Fit ARIMA on log returns and GARCH on residuals.
 
-    Returns a small JSON-safe dict — never the full Keras config, which is large
-    and version-specific. Records what was *built*, so it cannot disagree with
-    the run it describes.
+    Uses auto_arima with d=0 (log returns are stationary) and BIC for
+    model selection. Caps total ARMA order at 10 to prevent overfitting.
+    Selects the best GARCH variant on ARIMA residuals.
 
-    Every failure path returns a dict with ``available=False``: a manifest is an
-    audit record, and failing to describe a model must not break the forecast it
-    describes.
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with 'log_return' column (from prepare_data_statistical).
+
+    Returns
+    -------
+    tuple of (ARIMA, ARCHModelResult)
+        arima_model : fitted pmdarima ARIMA model.
+        garch_model : fitted GARCH volatility model.
     """
-    out = {"name": name, "available": False}
-    if model is None:
-        return out
-    try:
-        layers = []
-        for layer in getattr(model, "layers", []):
-            entry = {"type": type(layer).__name__,
-                     "name": getattr(layer, "name", None)}
-            try:
-                shape = layer.output.shape
-                entry["output_shape"] = [None if d is None else int(d)
-                                         for d in shape]
-            except Exception:
-                pass
-            for attr in ("units", "filters", "rate", "kernel_size",
-                         "pool_size", "return_sequences", "activation"):
-                if hasattr(layer, attr):
-                    val = getattr(layer, attr)
-                    val = getattr(val, "__name__", val)
-                    if isinstance(val, (int, float, bool, str)):
-                        entry[attr] = val
-                    elif isinstance(val, (list, tuple)):
-                        entry[attr] = list(val)
-            layers.append(entry)
+    print("--- Training Statistical Models ---")
 
-        out.update({
-            "available": True,
-            "layers": layers,
-            "n_layers": len(layers),
-            "n_params": int(model.count_params()),
-            "loss": _readable(getattr(model, "loss", None)),
-            "optimizer": type(getattr(model, "optimizer", None)).__name__,
+    returns = df['log_return']
+
+    print("Fitting Auto-ARIMA to find best parameters...")
+    arima_model = pm.auto_arima(
+        returns,
+        start_p=0, start_q=0,
+        max_p=5, max_q=5,
+        max_order=10,
+        d=0,
+        seasonal=False,
+        information_criterion='bic',
+        stepwise=True,
+        suppress_warnings=True,
+        error_action='ignore',
+        trace=False,
+    )
+    print(f"Best ARIMA Order: {arima_model.order}")
+
+    arima_residuals = arima_model.resid()
+
+    print("Selecting best volatility model...")
+    garch_model = select_best_garch(arima_residuals)
+
+    return arima_model, garch_model
+
+
+# ==========================================
+# 3. Monte Carlo Simulation
+# ==========================================
+def _simulate_price_paths(arima_model, garch_model, last_price, horizon,
+                          method='simulation'):
+    """
+    Monte Carlo simulation of future price paths.
+
+    Computes the ARIMA deterministic mean forecast and delegates to the
+    shared GARCH path simulator, which combines it with GARCH-simulated
+    residual paths to produce realistic price distributions.
+
+    Parameters
+    ----------
+    arima_model : pmdarima.ARIMA
+        Fitted ARIMA model for mean return forecasts.
+    garch_model : arch.univariate.base.ARCHModelResult
+        Fitted GARCH volatility model (mean='Zero').
+    last_price : float
+        Last observed adjusted close price.
+    horizon : int
+        Number of steps to simulate.
+    method : str, optional
+        'simulation' (default) or 'bootstrap' (filtered historical
+        simulation); see :func:`model_utils.simulate_price_paths`.
+
+    Returns
+    -------
+    dict
+        'predicted_price', 'lower_bound', 'upper_bound', 'volatility' arrays.
+    """
+    arima_mean = arima_model.predict(n_periods=horizon)
+    return simulate_price_paths(arima_mean, garch_model, last_price, horizon,
+                                method=method)
+
+
+# ==========================================
+# 4. Forecast Generation
+# ==========================================
+def generate_forecasts(df, arima_model, garch_model, horizon, interval,
+                       method='simulation'):
+    """
+    Generate future price forecasts via Monte Carlo simulation.
+
+    Simulates thousands of return paths through the fitted ARIMA+GARCH
+    dynamics, then extracts empirical percentiles for point forecasts
+    and confidence intervals. This approach naturally respects fat tails,
+    skewness, and path-dependent volatility clustering.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Prepared DataFrame with 'adj_close' and datetime index.
+    arima_model : pmdarima.ARIMA
+        Fitted ARIMA model.
+    garch_model : arch.univariate.base.ARCHModelResult
+        Fitted GARCH volatility model.
+    horizon : int
+        Number of steps to forecast.
+    interval : str
+        'daily' or 'hourly'; affects date increment and market-hours logic.
+    method : str, optional
+        'simulation' (default) or 'bootstrap' (filtered historical simulation).
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with columns ['datetime', 'predicted_price', 'lower_bound',
+        'upper_bound', 'volatility'].
+    """
+    last_price = df['adj_close'].iloc[-1]
+    last_date = df.index[-1]
+
+    print(f"Simulating {_N_SIMS} price paths for {horizon} steps...")
+    sim = _simulate_price_paths(arima_model, garch_model, last_price, horizon,
+                                method=method)
+
+    future_dates = generate_future_dates(last_date, horizon, interval)
+
+    future_data = []
+    for i in range(horizon):
+        future_data.append({
+            'datetime': future_dates[i],
+            'predicted_price': sim['predicted_price'][i],
+            'lower_bound': sim['lower_bound'][i],
+            'upper_bound': sim['upper_bound'][i],
+            'volatility': sim['volatility'][i],
         })
-        if name and name in SPECS:
-            out["declared_spec"] = spec(name)
-            out["spec_driven"] = spec_driven(name)
-        out["fingerprint"] = fingerprint(
-            {"layers": layers, "loss": out["loss"], "optimizer": out["optimizer"]})
-    except Exception as exc:
-        out["note"] = f"introspection failed: {str(exc)[:120]}"
-    return out
+
+    return pd.DataFrame(future_data)
 
 
-def _readable(obj):
-    if obj is None:
-        return None
-    return getattr(obj, "__name__", None) or getattr(
-        obj, "name", None) or str(obj)
+# ==========================================
+# 5. Main Orchestrator (Call this from UI)
+# ==========================================
+#: The configuration before section 114, which every run keeps unless a switch
+#: is given: shocks drawn from the fitted distribution.
+ARIMA_LEGACY = dict(fhs=False)
 
 
-def attach(prediction_df, model, name):
+def resolve_switches(interval, horizon, fhs=None):
     """
-    Record a model's realised architecture on its prediction frame.
-
-    Uses ``DataFrame.attrs``, the convention this project already uses to carry
-    ``risk_log_returns`` from a model to the UI. Best-effort and silent: an audit
-    annotation must never be able to fail a forecast.
+    The switches a run uses. A switch left as None takes ARIMA_LEGACY's value;
+    an explicit value is kept. ``interval`` and ``horizon`` are taken so a
+    horizon-dependent default can be added without changing callers.
     """
-    try:
-        prediction_df.attrs["architecture"] = describe(model, name)
-    except Exception:
-        pass
-    return prediction_df
+    return {'fhs': ARIMA_LEGACY['fhs'] if fhs is None else bool(fhs)}
 
 
-def manifest_block(architectures):
+def arima_paths(df, interval, horizon, variants=(False,)):
     """
-    Condense per-model architecture records for the run manifest.
-
-    Stores the compact form (layer count, parameter count, fingerprint) rather
-    than every layer: the manifest is read by humans in an expander, and a
-    six-model layer dump would bury the seed and versions that sit next to it.
-    The fingerprint is what makes "was this the same network?" answerable.
+    Forecast paths for several ``fhs`` settings from one fit: {fhs: DataFrame}.
+    The fit does not depend on ``fhs``; only the simulated shocks do.
     """
-    block = {}
-    for name, arch in (architectures or {}).items():
-        if not isinstance(arch, dict) or not arch.get("available"):
-            continue
-        block[name] = {
-            "n_layers": arch.get("n_layers"),
-            "n_params": arch.get("n_params"),
-            "optimizer": arch.get("optimizer"),
-            "loss": arch.get("loss"),
-            "fingerprint": arch.get("fingerprint"),
-            "spec_driven": arch.get("spec_driven", False),
-        }
-    return block
+    interval = normalize_interval(interval)
+    max_obs = 750 if interval == 'daily' else 500
+    clean_df = prepare_data_statistical(df, max_obs=max_obs)
+    arima, garch = train_arima_garch(clean_df)
+    return {bool(f): generate_forecasts(clean_df, arima, garch, horizon, interval,
+                                        method='bootstrap' if f else 'simulation')
+            for f in variants}
 
 
-def describe_specs():
-    """Plain-text dump of every declared spec (for ``python architectures.py``)."""
-    lines = []
-    for name, sp in SPECS.items():
-        mark = "spec-driven" if spec_driven(name) else "introspection-only"
-        flag = "  [OVERRIDDEN]" if name in OVERRIDDEN else ""
-        lines.append(f"{name}  ({mark}){flag}")
-        for k, v in sp.items():
-            lines.append(f"    {k}: {v}")
-        lines.append(f"    fingerprint: {fingerprint(sp)}")
-        lines.append("")
-    if ARCH_FILE and OVERRIDDEN:
-        lines.append(f"overrides loaded from: {ARCH_FILE}")
-    lines.append("Models not listed (N-BEATS, TCN, Transformer) are recorded by "
-                 "introspection but not yet driven from here.")
-    return "\n".join(lines)
+def run_statistical_prediction(df: pd.DataFrame, interval: str, horizon: int,
+                               fhs=None):
+    """
+    Main function to run ARIMA+GARCH prediction.
 
+    Orchestrates data preparation, model training, and Monte Carlo
+    forecast generation with distribution-aware confidence intervals.
 
-if __name__ == "__main__":
-    print(describe_specs())
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Raw stock DataFrame with 'datetime' and 'adj_close' columns.
+    interval : str
+        '1d' / 'daily' / '1 Day' or '1h' / 'hourly' / '1 Hour'.
+    horizon : int
+        Number of future steps to predict.
+    fhs : bool or None, optional
+        None (default) takes ARIMA_LEGACY (README section 114): shocks drawn
+        from the fitted distribution. True draws them from the model's own
+        standardized residuals (filtered historical simulation).
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with columns ['datetime', 'predicted_price',
+        'lower_bound', 'upper_bound', 'volatility'].
+    """
+    interval = normalize_interval(interval)
+    sw = resolve_switches(interval, horizon, fhs)
+    print(f"--- Starting Statistical Prediction ({interval}) ---")
+    results_df = arima_paths(df, interval, horizon, variants=(sw['fhs'],))[sw['fhs']]
+    print("Prediction Complete.")
+    return results_df
 
 ```
