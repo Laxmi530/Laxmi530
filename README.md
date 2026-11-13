@@ -10,266 +10,425 @@
 ```
 import pandas as pd
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout
-import os
+import xgboost as xgb
+import lightgbm as lgb
+from scipy.optimize import nnls
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error
 import warnings
 
-from model_utils import (
-    normalize_interval,
-    reset_keras_seeds,
-    temporal_train_val_split,
-    default_keras_callbacks,
-    forecast_nn_direct,
-)
-
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
+from model_utils import normalize_interval, generate_future_dates, lgb_threads, xgb_threads
+from ML_model import create_features
+from direct_forecast import (
+    horizon_feature_cols, make_horizon_targets, training_frame,
+    compute_origin_row, conformal_calibration, conformal_quantile,
+)
+
 
 # ==========================================
-# 1. Build & Train Model
+# 0. Switches (README section 113)
 # ==========================================
-#: Network sizes other than the declared stack (README section 104).
-#: ``small``: Fischer and Krauss (European Journal of Operational Research 2018,
-#: "Deep learning with LSTM networks for financial market predictions"): one
-#: recurrent layer of 25 units, dropout 0.1 on the inputs and on the recurrent
-#: connections, straight to the output layer. ``single``: one layer of the
-#: declared stack's first width with its dropout and dense head (depth only).
-SIZES = ("standard", "single", "small")
+#: The combiners the stack can use. 'ridge' is the shipped Ridge(alpha=1) with an
+#: intercept. 'nnls' is least squares with non-negative weights and no intercept
+#: (Breiman, 'Stacked regressions', Machine Learning 1996). 'mean' is the plain
+#: average of the three members (the forecast combination puzzle: Smith and
+#: Wallis 2009; Claeskens, Magnus, Vasnev and Wang 2016).
+META_CHOICES = ('ridge', 'nnls', 'mean')
+#: The configuration before section 113, which every run up to
+#: gating.MAX_DIRECTIONAL_SESSIONS (and every hourly run) keeps.
+STACK_LEGACY = dict(meta='ridge', shrink=False, leaf_scale=False, purge=False)
+#: Daily bars beyond gating.MAX_DIRECTIONAL_SESSIONS: the Ridge combiner with a
+#: centre shrunk toward no change, larger leaves and purged chunks. Chosen on 32
+#: forecasts and confirmed on 72 fresh ones before the reserved period
+#: (run_stack_improve.py, README section 113).
+STACK_LONG = dict(meta='ridge', shrink=True, leaf_scale=True, purge=True)
 
 
-def _layers(size, sp):
-    """(units, output dropouts, input dropout, recurrent dropout, dense units)."""
-    if size == "small":
-        return [25], [], 0.1, 0.1, None
-    units = list(sp.get('recurrent_units', [64, 64, 32]))
-    drops = list(sp.get('dropout', [0.3, 0.3, 0.2]))
-    rec_drop = float(sp.get('recurrent_dropout', 0.1))
-    dense = int(sp.get('dense_units', 16))
-    if size == "single":
-        return units[:1], drops[:1], 0.0, rec_drop, dense
-    return units, drops, 0.0, rec_drop, dense
-
-
-def train_dl_model(X, y, model_type='LSTM', output_dim=1, size="standard"):
+def resolve_switches(interval, horizon, meta=None, shrink=None, leaf_scale=None,
+                     purge=None):
     """
-    Build and train a 3-layer stacked LSTM or GRU model.
+    The switches a run uses. A switch left as None takes the default: STACK_LONG
+    on daily bars beyond gating.MAX_DIRECTIONAL_SESSIONS, otherwise
+    STACK_LEGACY. An explicit value is kept.
+    """
+    from gating import MAX_DIRECTIONAL_SESSIONS
+    long = normalize_interval(interval) == 'daily' and int(horizon) > MAX_DIRECTIONAL_SESSIONS
+    base = STACK_LONG if long else STACK_LEGACY
+    given = dict(meta=meta, shrink=shrink, leaf_scale=leaf_scale, purge=purge)
+    out = {k: base[k] if v is None else v for k, v in given.items()}
+    out['meta'] = str(out['meta'])
+    if out['meta'] not in META_CHOICES:
+        raise ValueError(f"meta must be one of {META_CHOICES}, not {out['meta']!r}")
+    for k in ('shrink', 'leaf_scale', 'purge'):
+        out[k] = bool(out[k])
+    return out
 
-    Architecture: three recurrent layers (64, 64, 32 units) with
-    output dropout (0.3, 0.3, 0.2) and recurrent dropout (0.1) for
-    hidden-to-hidden regularisation, followed by a Dense bottleneck
-    (16 units, ReLU) and an ``output_dim``-wide linear output. Trained
-    with Huber loss, Adam optimiser with gradient clipping, learning-rate
-    scheduling, and early stopping on a temporal validation set (last 10%).
+
+def min_leaf(h, n_rows):
+    """Rows per leaf with leaf_scale: min(20 h, a fifth of the rows), at least 20
+    (as LightGBM's and XGBoost's section 97 and 101 setting)."""
+    return int(max(20, min(20 * h, n_rows // 5)))
+
+
+# ==========================================
+# 1. Base Model Definitions
+# ==========================================
+def _get_base_models(min_leaf_rows=None):
+    """
+    Create the three base learners for the stacking ensemble.
+
+    Returns XGBoost (pseudo-Huber loss), LightGBM (Huber loss), and
+    Ridge regression. All gradient-boosting models are configured with
+    early-stopping-compatible settings.
 
     Parameters
     ----------
-    X : np.ndarray
-        Input sequences of shape (n_samples, look_back, n_features).
-    y : np.ndarray
-        Targets of shape (n_samples,) or (n_samples, output_dim) — the
-        per-horizon cumulative log returns for direct multi-horizon output.
-    model_type : str, optional
-        'LSTM' or 'GRU' (default: 'LSTM').
-    output_dim : int, optional
-        Number of outputs (= forecast horizon for direct multi-horizon).
-        Default 1.
-    size : str, optional
-        One of :data:`SIZES`: ``'standard'`` (default, the declared stack),
-        ``'single'`` or ``'small'`` (README section 104).
+    min_leaf_rows : int, optional
+        None (default) keeps XGBoost's min_child_weight=5 and LightGBM's
+        min_child_samples=20; a number sets both (the leaf_scale switch).
 
     Returns
     -------
-    tf.keras.Model
-        Trained Keras model.
+    list of tuple
+        Each tuple is (name: str, model: estimator, engine: str).
     """
-    reset_keras_seeds()
-
-    n_features = X.shape[2]
-    look_back = X.shape[1]
-
-    X_train, X_val, y_train, y_val = temporal_train_val_split(X, y)
-
-    model = Sequential()
-
-    # Layer sizes come from architectures.SPECS rather than literals here, so the
-    # network is a declared, JSON-overridable object that the run manifest can
-    # record. The defaults reproduce the previous hardcoded stack exactly
-    # (64/64/32 recurrent, 0.3/0.3/0.2 dropout, Dense(16)) — see
-    # tests/test_architectures.py, which pins that equivalence.
-    import architectures as arch
-    sp = arch.spec('DL')
-    units, drops, in_drop, rec_drop, dense_units = _layers(size, sp)
-
-    print(f"Building {model_type} model ({look_back} steps x {n_features} "
-          f"features, units={units})...")
-
-    layer = LSTM if model_type == 'LSTM' else GRU
-
-    for i, n_units in enumerate(units):
-        is_last = (i == len(units) - 1)
-        kwargs = dict(return_sequences=not is_last, recurrent_dropout=rec_drop)
-        if in_drop:
-            kwargs['dropout'] = in_drop
-        if i == 0:
-            kwargs['input_shape'] = (look_back, n_features)
-        model.add(layer(n_units, **kwargs))
-        # A dropout list shorter than the unit list simply stops applying
-        # dropout, rather than raising: an over-ridden spec should degrade
-        # predictably, not crash a forecast.
-        if i < len(drops):
-            model.add(Dropout(drops[i]))
-
-    if dense_units:
-        model.add(Dense(dense_units, activation=sp.get('dense_activation', 'relu')))
-    model.add(Dense(output_dim))
-
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3, clipnorm=1.0),
-        loss='huber',
+    xgb_model = xgb.XGBRegressor(
+        objective='reg:pseudohubererror',
+        n_estimators=1000,
+        learning_rate=0.03,
+        max_depth=5,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
+        min_child_weight=5 if min_leaf_rows is None else min_leaf_rows,
+        random_state=42,
+        early_stopping_rounds=50,
+        **xgb_threads(),
     )
-
-    print("Training Model...")
-    model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        batch_size=32,
-        epochs=100,
-        callbacks=default_keras_callbacks(),
-        shuffle=True,
-        verbose=0,
+    lgb_model = lgb.LGBMRegressor(
+        objective='huber',
+        n_estimators=1000,
+        learning_rate=0.03,
+        num_leaves=31,
+        subsample=0.8,
+        subsample_freq=1,
+        colsample_bytree=0.8,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
+        min_child_samples=20 if min_leaf_rows is None else min_leaf_rows,
+        random_state=42,
+        verbose=-1,
+        **lgb_threads(),
     )
+    ridge_model = Ridge(alpha=1.0)
 
+    return [
+        ('xgboost', xgb_model, 'xgboost'),
+        ('lightgbm', lgb_model, 'lightgbm'),
+        ('ridge', ridge_model, 'ridge'),
+    ]
+
+
+def _fit_member(model, engine, X, y, X_es, y_es):
+    """Fit one member; the tree models stop early on (X_es, y_es)."""
+    if engine == 'xgboost':
+        model.fit(X, y, eval_set=[(X_es, y_es)], verbose=False)
+    elif engine == 'lightgbm':
+        model.fit(
+            X, y,
+            eval_set=[(X_es, y_es)],
+            eval_metric='rmse',
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=50, verbose=False),
+                lgb.log_evaluation(0),
+            ],
+        )
+    else:
+        model.fit(X, y)
     return model
 
 
-def train_dl_window_norm(X, Y, model_type='LSTM', output_dim=1, size="standard"):
-    """:func:`train_dl_model` on per-window-normalised inputs and targets
-    (``CNN_LSTM_model.WindowNormModel``)."""
-    from CNN_LSTM_model import WindowNormModel
-    Xt, sd = WindowNormModel.transform(X)
-    return WindowNormModel(train_dl_model(Xt, np.asarray(Y) / sd, model_type,
-                                          output_dim=output_dim, size=size))
-
-
-#: The configuration before README section 104.
-LEGACY = dict(inputs="features", window_norm=False, size="standard")
-
-#: The GRU's inputs on daily bars beyond gating.MAX_DIRECTIONAL_SESSIONS (13):
-#: the stock's own log returns, each window scaled by its own standard
-#: deviation. Passed rules A1-A3 on a draw not used before (20-90 session score
-#: 63.46% against 79.86%, lower at 5 of 6 origins; error 1.09 against 1.43
-#: times no change's; run_returns_followup.py, README section 108). The LSTM
-#: took the same default after passing the same rules on a further unused draw
-#: (20-90 session score 119.30% against 130.40%, lower at 6 of 6 origins; error
-#: 1.03 against 1.17; run_long_followup.py, README section 109). Hourly bars and
-#: both models up to 13 sessions keep LEGACY.
-GRU_LONG = dict(inputs="returns", window_norm=True)
-#: The model types that take GRU_LONG beyond 13 daily sessions.
-LONG_MODELS = ("GRU", "LSTM")
-
-
-def resolve_switches(model_type, interval, horizon, inputs=None, window_norm=None):
+# ==========================================
+# 2. Out-of-Fold Prediction Generation
+# ==========================================
+def _train_and_predict_oof(features_df, feature_cols, target_col,
+                           min_leaf_rows=None, purge=0):
     """
-    The ``(inputs, window_norm)`` a run uses. A switch left as None takes the
-    default: :data:`GRU_LONG` for the GRU and the LSTM (:data:`LONG_MODELS`) on
-    daily bars beyond ``gating.MAX_DIRECTIONAL_SESSIONS``, otherwise
-    :data:`LEGACY`. An explicit value is kept; an explicit ``inputs`` that
-    differs from the default's keeps window scaling off unless it is asked for.
+    Train base models and generate out-of-fold meta-features.
+
+    Splits data temporally into three chunks:
+    - 60 % for base model training
+    - 20 % for meta-feature generation (OOF predictions)
+    - 20 % held out as final validation
+
+    Each base model is trained on the first chunk, then predicts on
+    the second chunk.  The stacked OOF predictions become meta-features
+    for the meta-learner.
+
+    Parameters
+    ----------
+    features_df : pd.DataFrame
+        Engineered features with datetime index.
+    feature_cols : list of str
+        Ordered list of feature column names.
+    target_col : str
+        Target column name in features_df.
+    min_leaf_rows : int, optional
+        Rows per leaf for the tree members (see :func:`_get_base_models`).
+    purge : int, optional
+        Rows dropped from the end of each training chunk (the first chunk, and
+        the first two chunks for the refit), so that no training label's h-step
+        window reaches into the block after it. 0 (default) drops none.
+
+    Returns
+    -------
+    meta_X : np.ndarray
+        (n_oof, 3) stacked OOF predictions from base models.
+    meta_y : np.ndarray
+        (n_oof,) true target values for OOF portion.
+    trained_base : list of tuple
+        (name, fitted_model, engine) for each base model, retrained
+        on the combined train+OOF data for final prediction.
+    feature_cols : list of str
+        Feature columns used.
+    val_mae : dict
+        Base-model-name -> MAE on the final validation chunk.
     """
-    from gating import MAX_DIRECTIONAL_SESSIONS
-    long = (str(model_type).upper() in LONG_MODELS and normalize_interval(interval) == "daily"
-            and int(horizon) > MAX_DIRECTIONAL_SESSIONS)
-    default = GRU_LONG if long else {k: LEGACY[k] for k in ("inputs", "window_norm")}
-    if inputs is None:
-        inputs = default["inputs"]
-    if window_norm is None:
-        window_norm = default["window_norm"] if inputs == default["inputs"] else False
-    return inputs, bool(window_norm)
+    X_all = features_df[feature_cols].values
+    y_all = features_df[target_col].values
+
+    n = len(X_all)
+    split_1 = int(n * 0.6)
+    split_2 = int(n * 0.8)
+    # The purge never leaves fewer than 50 rows to train on.
+    cut_1 = split_1 - purge if split_1 - purge >= 50 else split_1
+    cut_2 = split_2 - purge if split_2 - purge >= 50 else split_2
+
+    X_base = X_all[:cut_1]
+    y_base = y_all[:cut_1]
+    X_oof = X_all[split_1:split_2]
+    y_oof = y_all[split_1:split_2]
+    X_val = X_all[split_2:]
+    y_val = y_all[split_2:]
+
+    oof_preds = []
+    val_mae = {}
+
+    for name, model, engine in _get_base_models(min_leaf_rows):
+        _fit_member(model, engine, X_base, y_base, X_oof, y_oof)
+        oof_preds.append(model.predict(X_oof))
+        pred_val = model.predict(X_val)
+        val_mae[name] = mean_absolute_error(y_val, pred_val)
+        print(f"  {name} val MAE: {val_mae[name]:.6f}")
+
+    meta_X = np.column_stack(oof_preds)
+    meta_y = y_oof
+
+    retrained = []
+    X_retrain = X_all[:cut_2]
+    y_retrain = y_all[:cut_2]
+
+    for name, m, engine in _get_base_models(min_leaf_rows):
+        retrained.append((name, _fit_member(m, engine, X_retrain, y_retrain, X_val, y_val), engine))
+
+    return meta_X, meta_y, retrained, feature_cols, val_mae
 
 
 # ==========================================
-# 2. Main Orchestrator
+# 3. Meta-Learner Training
 # ==========================================
-def run_DL_prediction(df: pd.DataFrame, interval: str, horizon: int,
-                      model_type='LSTM', inputs=None, window_norm=None,
-                      size="standard"):
+def _train_meta_learner(meta_X, meta_y):
     """
-    Main function to run LSTM or GRU prediction.
+    Train a Ridge meta-learner on stacked base-model predictions.
 
-    Orchestrates data preparation (9-feature engineering with RSI,
-    momentum, dual-window volatility, z-score, and acceleration),
-    model training with recurrent dropout and temporal validation,
-    and direct multi-horizon forecasting (one output per step, no
-    recursive feedback) with distribution-free conformal prediction
-    intervals. Training data is limited to recent observations to
-    focus on the current market regime.
+    Ridge regression is chosen for its stability and resistance to
+    overfitting when the meta-feature space is very small (3 columns).
+
+    Parameters
+    ----------
+    meta_X : np.ndarray
+        (n_oof, 3) stacked OOF predictions.
+    meta_y : np.ndarray
+        (n_oof,) true target values.
+
+    Returns
+    -------
+    Ridge
+        Fitted meta-learner.
+    """
+    meta = Ridge(alpha=1.0)
+    meta.fit(meta_X, meta_y)
+    meta_pred = meta.predict(meta_X)
+    mae = mean_absolute_error(meta_y, meta_pred)
+    print(f"  Meta-learner OOF MAE: {mae:.6f}")
+    return meta
+
+
+def combiner(meta, meta_X, meta_y):
+    """
+    A function mapping the members' predictions (rows x 3) to the stack's, for
+    the combiner ``meta``: 'ridge' (the shipped Ridge with an intercept), 'nnls'
+    (non-negative weights, no intercept) or 'mean' (the plain average).
+    """
+    if meta == 'ridge':
+        return _train_meta_learner(meta_X, meta_y).predict
+    if meta == 'nnls':
+        w, _ = nnls(np.asarray(meta_X, dtype=float), np.asarray(meta_y, dtype=float))
+        return lambda X: np.asarray(X, dtype=float) @ w
+    if meta == 'mean':
+        return lambda X: np.asarray(X, dtype=float).mean(axis=1)
+    raise ValueError(f"meta must be one of {META_CHOICES}, not {meta!r}")
+
+
+# ==========================================
+# 4. Main Orchestrator (Direct Multi-Horizon)
+# ==========================================
+def stack_paths(df, interval, horizon, leaf_scale=False, purge=False,
+                variants=(('ridge', False),)):
+    """
+    Forecast paths for several (meta, shrink) settings from one set of fits.
+
+    The members do not depend on the combiner or on ``shrink``, so every
+    setting in ``variants`` is read from the same fits; ``leaf_scale`` and
+    ``purge`` change the fits and are fixed for the call. Returns
+    {(meta, shrink): DataFrame}. With ``variants=(('ridge', False),)`` and both
+    other switches off this is the shipped model.
+    """
+    interval = normalize_interval(interval)
+    variants = tuple((str(m), bool(s)) for m, s in variants)
+    metas = tuple(dict.fromkeys(m for m, _ in variants))
+    for m in metas:
+        if m not in META_CHOICES:
+            raise ValueError(f"meta must be one of {META_CHOICES}, not {m!r}")
+
+    df = df.copy()
+    max_obs = 1000 if interval == 'daily' else 750
+    if len(df) > max_obs:
+        df = df.iloc[-max_obs:]
+
+    features_df = create_features(df, interval)
+    feature_cols = horizon_feature_cols(features_df)
+    targets = make_horizon_targets(features_df, horizon)
+
+    origin_X, last_price, last_date = compute_origin_row(
+        df, feature_cols, interval,
+    )
+    origin_vals = origin_X.values   # base models are trained on numpy arrays
+    future_dates = generate_future_dates(last_date, horizon, interval)
+
+    print(f"Training {horizon} direct stacking-ensemble horizon models...")
+
+    rows = {v: [] for v in variants}
+    for i, h in enumerate(range(1, horizon + 1)):
+        target_name = f'target_h{h}'
+        train_df = training_frame(
+            features_df, feature_cols, targets[h], target_name,
+        )
+        leaf = min_leaf(h, len(train_df)) if leaf_scale else None
+        gap = h if purge else 0
+
+        meta_X, meta_y, trained_base, _, _ = _train_and_predict_oof(
+            train_df, feature_cols, target_name, leaf, gap,
+        )
+        base_preds = np.array([[model.predict(origin_vals)[0] for _, model, _ in trained_base]])
+        cum = {m: float(combiner(m, meta_X, meta_y)(base_preds)[0]) for m in metas}
+
+        def _stack_fit_predict(proper_df, X_cal, _tn=target_name, _leaf=leaf, _gap=gap):
+            """Train the full stack on proper-train rows; predict the
+            calibration rows with every combiner (one column each)."""
+            mX, mY, base, _, _ = _train_and_predict_oof(
+                proper_df, feature_cols, _tn, _leaf, _gap,
+            )
+            cal_vals = X_cal.values
+            base_stack = np.column_stack([m.predict(cal_vals) for _, m, _ in base])
+            return np.column_stack([combiner(m, mX, mY)(base_stack) for m in metas])
+
+        parts = conformal_calibration(
+            train_df, feature_cols, target_name, _stack_fit_predict, embargo=h,
+        )
+        fallback = 1.96 * float(np.std(train_df[target_name].values))
+
+        for meta, shrink in variants:
+            ret = cum[meta]
+            half = None
+            if parts is not None:
+                y_cal, p_all = parts
+                p_cal = p_all[:, metas.index(meta)]
+                if shrink:
+                    den = float(np.sum(p_cal * p_cal))
+                    beta = float(np.clip(np.sum(p_cal * y_cal) / den, 0.0, 1.0)) if den > 0 else 0.0
+                    ret *= beta
+                    half = conformal_quantile(y_cal - beta * p_cal)
+                else:
+                    half = conformal_quantile(y_cal - p_cal)
+            if half is None:
+                half = fallback
+
+            median = last_price * np.exp(ret)
+            lower = last_price * np.exp(ret - half)
+            upper = last_price * np.exp(ret + half)
+            rows[(meta, shrink)].append({
+                'datetime': future_dates[i],
+                'predicted_price': float(median),
+                'lower_bound': float(lower),
+                'upper_bound': float(upper),
+                'volatility': float((upper - lower) / (2 * 1.96)),
+            })
+
+    return {v: pd.DataFrame(r) for v, r in rows.items()}
+
+
+def run_ensemble_prediction(df, interval, horizon, meta=None, shrink=None,
+                            leaf_scale=None, purge=None):
+    """
+    Main function to run the stacking ensemble prediction.
+
+    Uses **direct multi-horizon** forecasting: for each step ``h`` a full
+    stacking ensemble (XGBoost + LightGBM + Ridge base learners with a Ridge
+    meta-learner, trained on temporally-honest out-of-fold predictions) targets
+    the *cumulative* log return ``log(P[t+h]/P[t])`` and forecasts directly from
+    the observed features at the last bar. This removes the recursive error
+    accumulation (and one-bar origin offset) that made the recursive ensemble a
+    bottom performer in the walk-forward backtest, while preserving the
+    leakage-aware OOF stacking design. Distribution-free **conformal**
+    prediction intervals are added per horizon via a temporal split-conformal
+    calibration of the full stack.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Raw stock DataFrame with 'datetime' and 'adj_close' columns.
+        Raw stock DataFrame with datetime, OHLCV columns.
     interval : str
         '1d' / 'daily' / '1 Day' or '1h' / 'hourly' / '1 Hour'.
     horizon : int
-        Number of future steps to predict.
-    model_type : str, optional
-        'LSTM' (default) or 'GRU'.
-    inputs : str, optional
-        ``'features'``: the nine shared price features plus any market
-        context. ``'returns'``: the stock's own log returns only (README
-        sections 94, 103 and 104). None (default): :func:`resolve_switches`,
-        own returns for the GRU and the LSTM on daily bars beyond 13 sessions
-        (README sections 108 and 109), the nine features otherwise.
-    window_norm : bool, optional
-        True: each window centred and scaled by its own standard deviation,
-        the forecast scaled back (needs ``inputs='returns'``). None (default):
-        :func:`resolve_switches`.
-    size : str, optional
-        ``'standard'`` (default), ``'single'`` or ``'small'``; see :data:`SIZES`.
+        Number of future steps.
+    meta, shrink, leaf_scale, purge : optional
+        None (default) takes :func:`resolve_switches`'s default (README
+        section 113): STACK_LONG (shrink, leaf_scale and purge on) on daily
+        bars beyond 13 sessions, otherwise STACK_LEGACY (the Ridge combiner,
+        no shrink, the members' own leaf sizes, no purge).
+        ``meta`` is 'ridge', 'nnls' or 'mean' (see :func:`combiner`);
+        ``shrink`` shrinks each step's return toward no change by the
+        calibration block's least-squares slope through the origin, clipped to
+        [0, 1]; ``leaf_scale`` sets the members' rows per leaf to
+        :func:`min_leaf`; ``purge`` drops h rows at the end of each training
+        chunk inside the stack.
 
     Returns
     -------
     pd.DataFrame
-        DataFrame with columns ['datetime', 'predicted_price',
-        'lower_bound', 'upper_bound', 'volatility'].
+        Columns: ['datetime', 'predicted_price', 'lower_bound',
+        'upper_bound', 'volatility'].
     """
     interval = normalize_interval(interval)
-    print(f"--- Starting {model_type} Prediction ({interval}) ---")
-    inputs, window_norm = resolve_switches(model_type, interval, horizon, inputs, window_norm)
-    if inputs not in ("features", "returns"):
-        raise ValueError(f"inputs must be 'features' or 'returns', not {inputs!r}")
-    if window_norm and inputs != "returns":
-        raise ValueError("window_norm needs inputs='returns': a window of mixed "
-                         "features has no single scale")
-    if size not in SIZES:
-        raise ValueError(f"size must be one of {SIZES}, not {size!r}")
-
-    df = df.copy()
-    df['datetime'] = pd.to_datetime(df['datetime'])
-
-    max_obs = 1000 if interval == 'daily' else 750
-    if len(df) > max_obs:
-        df = df.tail(max_obs).reset_index(drop=True)
-
-    look_back = 90 if interval == 'daily' else 48
-
-    trainer = train_dl_window_norm if window_norm else train_dl_model
-    feature_fn = None
-    if inputs == "returns":
-        from NBeats_model import returns_only as feature_fn
-
-    results_df = forecast_nn_direct(
-        df, interval, horizon, look_back,
-        build_train_fn=lambda X, Y, od: trainer(X, Y, model_type, output_dim=od, size=size),
-        model_name='DL',
-        feature_fn=feature_fn,
-        use_context=inputs == "features",
-    )
-
-    print(f"{model_type} Prediction Complete.")
-    return results_df
+    sw = resolve_switches(interval, horizon, meta, shrink, leaf_scale, purge)
+    print(f"--- Starting Stacking Ensemble Prediction ({interval}) ---")
+    v = (sw['meta'], sw['shrink'])
+    out = stack_paths(df, interval, horizon, sw['leaf_scale'], sw['purge'], variants=(v,))[v]
+    print("Stacking Ensemble Prediction Complete.")
+    return out
 ```
