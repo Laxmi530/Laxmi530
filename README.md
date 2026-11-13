@@ -8,303 +8,344 @@
 - Code
   
 ```
-"""
-The app's serving pipeline without Streamlit: fetch, run each model, assess
-it, gate it.
-
-``UI.py`` wraps these in ``st.cache_data`` and renders what they return;
-``run_watchlist.py`` calls them on a schedule (README section 78). Both
-paths therefore serve, gate and log a forecast the same way, which is what
-lets the scheduled forecasts stand in for served ones in the forward
-prediction log.
-"""
-
-import numpy as np
 import pandas as pd
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, Model, Input
+import os
+import warnings
 
-import config as _cfg
-from ARIMA_GARCH import run_statistical_prediction
-from ARIMAX_model import run_arimax_prediction
-from CNN_LSTM_model import run_cnn_lstm_prediction
-from chronos_model import run_chronos_prediction
-from config import USE_ASYMMETRIC_CONE, USE_IV_ADJUST
-from DL_model import run_DL_prediction
-from Ensemble_model import run_ensemble_prediction
-from fb_prophet_model import run_prophet_prediction
-from HAR_RV_model import run_har_rv_prediction
-from Hybrid_model import run_hybrid_prediction
-from kalman_model import run_kalman_prediction
-from meta_ensemble import run_meta_ensemble_prediction
-from ML_model import run_ML_prediction
-from NBeats_model import run_nbeats_prediction
-from Quantile_model import run_quantile_prediction
-from RegimeSwitching_model import run_regime_prediction
-from TCN_model import run_tcn_prediction
-from Transformer_model import run_transformer_prediction
-from vol_lstm_model import run_vol_lstm_prediction
+from model_utils import (
+    normalize_interval,
+    reset_keras_seeds,
+    temporal_train_val_split,
+    default_keras_callbacks,
+    forecast_nn_direct,
+)
 
-# Single source of truth for the model suite: (display name, function, kwargs),
-# in execution order. The sidebar selector, the runner, and the cache key all
-# derive from this list. NOTE: Meta-Ensemble internally re-runs Quantile-LGBM +
-# XGBoost + ARIMA (ARIMAX's pipeline without regressors), so selecting it alongside those duplicates that compute;
-# per-model caching (in UI.py) makes the duplication a cache hit rather than a
-# recomputation.
-MODEL_REGISTRY = [
-    ("ARIMA-GARCH", run_statistical_prediction, {}),
-    ("ARIMAX-GARCH", run_arimax_prediction, {}),
-    ("Prophet", run_prophet_prediction, {}),
-    ("LSTM (DL)", run_DL_prediction, {'model_type': 'LSTM'}),
-    ("GRU (DL)", run_DL_prediction, {'model_type': 'GRU'}),
-    ("XGBoost (ML)", run_ML_prediction, {'model_type': 'xgboost'}),
-    ("LightGBM (ML)", run_ML_prediction, {'model_type': 'lightgbm'}),
-    ("Transformer", run_transformer_prediction, {}),
-    ("Chronos-2", run_chronos_prediction, {}),  # company_name injected at call
-    ("N-BEATS", run_nbeats_prediction, {}),
-    ("TCN", run_tcn_prediction, {}),
-    ("CNN-LSTM", run_cnn_lstm_prediction, {}),
-    ("Stacking Ensemble", run_ensemble_prediction, {}),
-    ("Quantile (LGB)", run_quantile_prediction, {}),
-    ("Regime Switching", run_regime_prediction, {}),
-    ("Hybrid ARIMA+LSTM", run_hybrid_prediction, {}),
-    # The only state-space model in the suite: parameters are re-estimated every
-    # bar rather than frozen after a fit, and the interval falls out of the state
-    # covariance instead of a conformal calibration (Klaas Ch. 4).
-    ("Kalman (local trend)", run_kalman_prediction, {}),
-    ("HAR-RV (volatility)", run_har_rv_prediction,
-     {'iv_adjust': USE_IV_ADJUST, 'asymmetric': USE_ASYMMETRIC_CONE}),
-    ("Vol-LSTM (volatility)", run_vol_lstm_prediction,
-     {'asymmetric': USE_ASYMMETRIC_CONE}),
-    ("Meta-Ensemble", run_meta_ensemble_prediction, {}),
-]
-MODEL_NAMES = [name for name, _, _ in MODEL_REGISTRY]
-#: A note shown on a model's card whenever it runs (README sections 89 and 92).
-MODEL_NOTES = {
-    "Prophet": ("On daily NSE data before 2025, Prophet's own trend and seasonality forecast "
-                "worse than no change (README section 89). Its predicted change is now shrunk "
-                "toward no change by how well it predicted at 20 recent dates, often to none, "
-                "and its error is then about that of a no-change forecast (README section 116 "
-                "for daily bars, README section 118 for hourly bars). Weigh its range, not "
-                "its line."),
-}
-#: Listed in the app but not selected by default. Empty since section 92: every
-#: model starts selected and the user decides, with MODEL_NOTES on the card.
-OFF_BY_DEFAULT = frozenset()
-DEFAULT_MODELS = [m for m in MODEL_NAMES if m not in OFF_BY_DEFAULT]
-_MODEL_LOOKUP = {name: (func, kwargs) for name, func, kwargs in MODEL_REGISTRY}
+#: Network sizes (README section 105). ``standard``: the shipped network, 64
+#: filters per block and a dense head of 64 and 32. ``small``: 16 filters per
+#: block and a linear output from the last step, no dense head; Bai, Kolter and
+#: Koltun (arXiv 1803.01271) used 20-27 channels on their small tasks, and
+#: Borovykh, Bohte and Oosterlee (arXiv 1703.04691) one filter per layer on
+#: daily S&P 500 returns.
+SIZES = {"standard": dict(filters=64, mlp_units=None),
+         "small": dict(filters=16, mlp_units=[])}
 
-# Walk-forward confidence-gate settings (kept light so it stays interactive).
-GATE_SPLITS = _cfg.GATE_SPLITS
-GATE_MIN_TRAIN = _cfg.GATE_MIN_TRAIN
-GATE_MAX_ROWS = _cfg.GATE_MAX_ROWS
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 
-def _call_args(company_name, model_name):
-    func, kwargs = _MODEL_LOOKUP[model_name]
-    kwargs = dict(kwargs)
-    if model_name == "Chronos-2":
-        kwargs["company_name"] = company_name
-    return func, kwargs
-
-
-def fetch_history(company_name, backend_interval, use_context, note=None):
+# ==========================================
+# 1. TCN Residual Block
+# ==========================================
+def tcn_residual_block(x, filters, kernel_size, dilation_rate, dropout):
     """
-    Historical OHLCV for a company, optionally with market-context features.
+    Single Temporal Convolutional Network residual block with skip output.
 
-    Resilient fetch: retries + last-known-good cache fallback, tagging
-    ``attrs['source']`` (live / partial / cached_fallback), which the
-    data-quality gate reads. Returns None when the backend returned nothing.
-    ``note(msg)`` receives a skipped-enrichment message.
-    """
-    from get_data import get_whole_stock_data
-    from safe_fetch import fetch_with_fallback
-    hist_df = fetch_with_fallback(
-        company_name, backend_interval, fetch_fn=get_whole_stock_data)
-    if not isinstance(hist_df, pd.DataFrame) or hist_df.empty:
-        return None
-    if use_context:
-        try:
-            from market_context import add_market_context
-            hist_df = add_market_context(hist_df, backend_interval)
-        except Exception as ctx_err:
-            if note:
-                note(f"market-context enrichment skipped: {ctx_err}")
-    return hist_df
+    Architecture: two stacked causal Conv1D layers (each followed by
+    LayerNorm and ReLU, with one SpatialDropout after the second
+    activation), plus a residual connection.  If the channel dimension
+    of the input differs from ``filters``, a 1x1 convolution projects
+    the input before adding.  Returns both the residual output (fed
+    to the next block) and a skip output (for cross-block aggregation).
 
-
-def run_model(hist_df, company_name, backend_interval, horizon, model_name):
-    """One model's prediction, its 95% band widened to be monotone (README section 70)."""
-    func, kwargs = _call_args(company_name, model_name)
-    out = func(hist_df, backend_interval, horizon, **kwargs)
-    from model_utils import widen_to_monotone
-    return widen_to_monotone(out)
-
-
-def get_col_by_candidates(df, candidates):
-    """
-    Find the first existing column from a list of candidates (case-insensitive).
-
-    Returns the actual column name from the DataFrame if found, else None.
-    """
-    df_cols = [c.lower() if isinstance(c, str) else str(c).lower()
-               for c in df.columns]
-    for cand in candidates:
-        if cand.lower() in df_cols:
-            return df.columns[df_cols.index(cand.lower())]
-    return None
-
-
-PRICE_COLS = ['predicted_price', 'prediction', 'forecast', 'yhat', 'pred']
-HIST_PRICE_COLS = ['adj_close', 'adj close', 'close', 'price']
-
-
-def final_price(pred_df):
-    """The last predicted price, or NaN when the frame has none."""
-    col = get_col_by_candidates(pred_df, PRICE_COLS)
-    if col is None or not len(pred_df):
-        return float('nan')
-    return float(pd.to_numeric(pred_df[col], errors='coerce').iloc[-1])
-
-
-def is_usable(pred_df):
-    """
-    A forecast the app may serve. A NaN/inf final price is a failed fit, not a
-    forecast: kept, it read as "Bearish" (NaN >= 0 is False) and turned the risk
-    panel's median NaN.
-    """
-    return (isinstance(pred_df, pd.DataFrame) and len(pred_df) > 0
-            and bool(np.isfinite(final_price(pred_df))))
-
-
-def model_confidence(hist_df, company_name, backend_interval, horizon, model_name):
-    """
-    A model's recent skill from a light walk-forward backtest, and its bucket.
-
-    The serve-time "predictability gate": per request, whether the model
-    actually beats a random walk here.
+    Parameters
+    ----------
+    x : tf.Tensor
+        Input tensor of shape (batch, timesteps, channels).
+    filters : int
+        Number of convolutional filters (output channels).
+    kernel_size : int
+        Width of the causal convolution kernel.
+    dilation_rate : int
+        Dilation factor controlling the receptive-field growth.
+    dropout : float
+        Dropout rate applied after the second activation.
 
     Returns
     -------
-    dict
-        {'bucket', 'improvement', 'dm_p', 'coverage', 'model_rmse',
-         'baseline_rmse', 'n_eval', 'note'}.
+    residual : tf.Tensor
+        Output tensor of shape (batch, timesteps, filters) — fed to
+        the next block.
+    skip : tf.Tensor
+        Skip connection tensor of shape (batch, timesteps, filters) —
+        collected and summed across all blocks.
     """
-    import backtest as bt
-    from backtest import confidence_bucket
+    conv = layers.Conv1D(
+        filters, kernel_size, padding='causal',
+        dilation_rate=dilation_rate,
+        kernel_initializer='he_normal',
+    )(x)
+    conv = layers.LayerNormalization()(conv)
+    conv = layers.Activation('relu')(conv)
 
-    base = {'bucket': 'N/A', 'improvement': float('nan'), 'dm_p': float('nan'),
-            'coverage': float('nan'), 'model_rmse': float('nan'),
-            'baseline_rmse': float('nan'), 'n_eval': 0, 'note': ''}
-    if hist_df is None or len(hist_df) < GATE_MIN_TRAIN + horizon + 10:
-        base['bucket'] = 'No data'
-        base['note'] = 'insufficient history for a walk-forward check'
-        return base
+    conv = layers.Conv1D(
+        filters, kernel_size, padding='causal',
+        dilation_rate=dilation_rate,
+        kernel_initializer='he_normal',
+    )(conv)
+    conv = layers.LayerNormalization()(conv)
+    conv = layers.Activation('relu')(conv)
+    conv = layers.SpatialDropout1D(dropout)(conv)
 
-    gate_df = hist_df.tail(GATE_MAX_ROWS).reset_index(drop=True)
-    func, kwargs = _call_args(company_name, model_name)
+    if x.shape[-1] != filters:
+        x = layers.Conv1D(filters, 1, kernel_initializer='he_normal')(x)
 
-    try:
-        res = bt.walk_forward_backtest(
-            gate_df, func, backend_interval, horizon,
-            n_splits=GATE_SPLITS, min_train=GATE_MIN_TRAIN,
-            predict_kwargs=kwargs, model_name=model_name, verbose=False,
-            # The serve-time gate needs the RMSE/DM summary only. The economic
-            # block is deliberately NOT surfaced here: with 3 origins its Sharpe
-            # would be pure noise, and showing a noisy Sharpe next to a
-            # calibrated confidence bucket would undercut the honesty the gate
-            # exists to provide. Use tests/validation/run_strategy_eval.py, which
-            # runs enough non-overlapping origins for the number to mean something.
-            strategy=False,
-        )
-    except Exception as exc:
-        base['note'] = f'assessment failed: {str(exc)[:80]}'
-        return base
+    residual = layers.Add()([x, conv])
+    skip = conv
 
-    s = res['summary']
-    dm = res.get('dm', {})
-    model_rmse = float(s.loc['rmse', 'model'])
-    baseline_rmse = min(
-        float(s.loc['rmse', c]) for c in ('naive', 'drift', 'ar1')
-        if c in s.columns
+    return residual, skip
+
+
+def _compute_dilations(look_back, kernel_size=3):
+    """
+    Compute dilation rates so the receptive field fits the look-back.
+
+    Grows dilations exponentially (1, 2, 4, ...) until the cumulative
+    receptive field reaches or exceeds ``look_back``.  Avoids wasted
+    layers whose receptive fields overshoot the input length.
+
+    Parameters
+    ----------
+    look_back : int
+        Input sequence length.
+    kernel_size : int, optional
+        Convolution kernel width. Default 3.
+
+    Returns
+    -------
+    list of int
+        Dilation rates for the TCN blocks.
+    """
+    dilations = []
+    receptive = 1
+    d = 1
+    while receptive < look_back:
+        dilations.append(d)
+        receptive += (kernel_size - 1) * d * 2
+        d *= 2
+    return dilations
+
+
+# ==========================================
+# 2. Build TCN Model
+# ==========================================
+def build_tcn_model(input_shape, filters=64, kernel_size=3,
+                    dilations=None, dropout=0.15, mlp_units=None,
+                    output_dim=1):
+    """
+    Build a Temporal Convolutional Network for time-series regression.
+
+    Architecture: stack of TCN residual blocks with exponentially
+    increasing dilation rates (auto-sized to the look-back window)
+    and cross-block skip connections -> last-timestep extraction
+    from summed skips -> MLP head -> single output.
+
+    Skip connections aggregate information at multiple temporal
+    scales and the last-timestep extraction focuses the model on the
+    most recent state, analogous to the final hidden state in an RNN.
+
+    Parameters
+    ----------
+    input_shape : tuple of int
+        (sequence_length, n_features).
+    filters : int, optional
+        Number of convolutional filters per block. Default 64.
+    kernel_size : int, optional
+        Causal convolution kernel width. Default 3.
+    dilations : list of int, optional
+        Dilation rates for successive blocks.  If None, auto-computed
+        from ``input_shape[0]`` to just cover the look-back window.
+    dropout : float, optional
+        Dropout rate (single layer per block). Default 0.15.
+    mlp_units : list of int, optional
+        MLP head hidden sizes. Default [64, 32].
+
+    Returns
+    -------
+    tf.keras.Model
+        Compiled TCN model.
+    """
+    if dilations is None:
+        dilations = _compute_dilations(input_shape[0], kernel_size)
+    if mlp_units is None:
+        mlp_units = [64, 32]
+
+    inputs = Input(shape=input_shape)
+    x = inputs
+    skip_connections = []
+
+    for d in dilations:
+        x, skip = tcn_residual_block(x, filters, kernel_size, d, dropout)
+        skip_connections.append(skip)
+
+    if len(skip_connections) > 1:
+        x = layers.Add()(skip_connections)
+    else:
+        x = skip_connections[0]
+
+    x = layers.Lambda(lambda t: t[:, -1, :])(x)
+
+    for dim in mlp_units:
+        x = layers.Dense(dim, activation='relu',
+                         kernel_initializer='he_normal')(x)
+        x = layers.Dropout(dropout)(x)
+
+    outputs = layers.Dense(output_dim, kernel_initializer='he_normal')(x)
+
+    model = Model(inputs, outputs)
+    model.compile(
+        loss='huber',
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3, clipnorm=1.0),
     )
-    improvement = ((baseline_rmse - model_rmse) / baseline_rmse
-                   if baseline_rmse > 0 else 0.0)
-    dm_p = float(dm.get('p_value', float('nan')))
-    coverage = (float(s.loc['coverage', 'model'])
-                if 'coverage' in s.index else float('nan'))
-
-    return {
-        'bucket': confidence_bucket(improvement, dm_p, coverage),
-        'improvement': improvement,
-        'dm_p': dm_p,
-        'coverage': coverage,
-        'model_rmse': model_rmse,
-        'baseline_rmse': baseline_rmse,
-        'n_eval': len(res.get('origins', [])),
-        'note': '',
-    }
+    return model
 
 
-def regime_novelty(hist_df, backend_interval):
+# ==========================================
+# 3. Training Wrapper
+# ==========================================
+def train_tcn(X, y, output_dim=1, size="standard"):
     """
-    How unlike its fitted history the latest market window is.
+    Build and train the TCN model with temporal validation.
 
-    Wraps ``autoencoder_regime.regime_novelty``. This is the signal the other two
-    gates cannot see: ``data_quality`` catches a broken *input*, and the
-    confidence bucket catches a model with no measured edge *in the past* — but
-    neither knows that the present regime is off-manifold, where a
-    backtest-derived bucket is an extrapolation rather than evidence. Every
-    failure path returns ``available=False``, which is a no-op for the gate,
-    so enabling this can only ever add information.
+    Clears TF session, sets random seeds, splits data temporally
+    (last 10 % for validation), and trains with early stopping
+    and learning-rate scheduling.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Input sequences (n_samples, look_back, n_features).
+    y : np.ndarray
+        Targets of shape (n_samples,) or (n_samples, output_dim) — the
+        per-horizon cumulative log returns for direct multi-horizon output.
+    output_dim : int, optional
+        Number of outputs (= forecast horizon for direct multi-horizon).
+        Default 1.
+    size : str, optional
+        A key of :data:`SIZES` (default ``'standard'``).
+
+    Returns
+    -------
+    tf.keras.Model
+        Trained TCN model.
     """
-    if hist_df is None:
-        return {'available': False, 'verdict': 'unknown', 'note': 'no history'}
-    try:
-        import autoencoder_regime as ar
-        return ar.regime_novelty(hist_df, backend_interval)
-    except Exception as exc:
-        return {'available': False, 'verdict': 'unknown',
-                'note': f'novelty check unavailable: {str(exc)[:100]}'}
+    reset_keras_seeds()
+
+    input_shape = X.shape[1:]
+
+    X_train, X_val, y_train, y_val = temporal_train_val_split(X, y)
+
+    print(
+        f"Building TCN model "
+        f"({input_shape[0]} steps x {input_shape[1]} features)..."
+    )
+    model = build_tcn_model(input_shape, output_dim=output_dim, **SIZES[size])
+
+    print("Training TCN...")
+    model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=100,
+        batch_size=32,
+        callbacks=default_keras_callbacks(),
+        shuffle=True,
+        verbose=0,
+    )
+    return model
 
 
-def last_price(hist_df):
-    """The last observed price, the forecast's anchor, or None."""
-    col = get_col_by_candidates(hist_df, HIST_PRICE_COLS)
-    return float(hist_df[col].iloc[-1]) if col else None
+def train_tcn_window_norm(X, Y, output_dim=1, size="standard"):
+    """:func:`train_tcn` on per-window-normalised inputs and targets
+    (``CNN_LSTM_model.WindowNormModel``)."""
+    from CNN_LSTM_model import WindowNormModel
+    Xt, sd = WindowNormModel.transform(X)
+    return WindowNormModel(train_tcn(Xt, np.asarray(Y) / sd, output_dim=output_dim, size=size))
 
 
-#: A served band more than BAND_SANITY times wider, or narrower, than the
-#: random-walk band the stock's own recent volatility implies is flagged
-#: (README section 85). Vol-LSTM's exploding bands (section 83) went unseen
-#: because every check looked at coverage, and a band wide enough covers all.
-BAND_SANITY = 4.0
-BAND_SANITY_WINDOW = 60
+#: The configuration before README section 105.
+LEGACY = dict(inputs="features", window_norm=False, size="standard", look_back=None)
 
 
-def band_sanity(pred_df, hist_df, ratio=BAND_SANITY, window=BAND_SANITY_WINDOW):
+# ==========================================
+# 4. Main Orchestrator
+# ==========================================
+def run_tcn_prediction(df, interval, horizon, inputs="features", window_norm=False,
+                       size="standard", look_back=None):
     """
-    ``(q, flagged)``: the last step's band width over the random-walk band.
+    Main function to run TCN prediction.
 
-    The reference is the 95% band of a random walk with the volatility of the
-    last ``window`` returns, ``exp(+-1.96 * sd * sqrt(h))`` around the last price,
-    in the history's own bar units (so hourly is compared with hourly). ``q`` is
-    NaN, and nothing is flagged, when the band or the history is missing.
+    Orchestrates data preparation (9-feature engineering), TCN model
+    building (dilated causal convolutions with cross-block skip
+    connections), training with temporal validation, and direct
+    multi-horizon forecasting (one output per step, no recursive feedback)
+    with distribution-free conformal prediction intervals.  Dilation rates
+    are auto-sized to the look-back window.  Training data is limited to
+    recent observations.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Raw stock DataFrame with 'datetime' and 'adj_close' columns.
+    interval : str
+        '1d' / 'daily' / '1 Day' or '1h' / 'hourly' / '1 Hour'.
+    horizon : int
+        Number of future steps to predict.
+    inputs : str, optional
+        ``'features'`` (default): the nine price features plus market context.
+        ``'returns'``: the stock's own log returns only (README section 105).
+    window_norm : bool, optional
+        True: each window centred and divided by its own standard deviation,
+        the forecast scaled back (needs ``inputs='returns'``).
+    size : str, optional
+        A key of :data:`SIZES` (default ``'standard'``).
+    look_back : int, optional
+        Window length; default 90 daily, 48 hourly; at least 10.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ['datetime', 'predicted_price', 'lower_bound',
+        'upper_bound', 'volatility'].
     """
-    nan = (float("nan"), False)
-    if not isinstance(pred_df, pd.DataFrame) or not {"lower_bound", "upper_bound"} <= set(pred_df.columns):
-        return nan
-    col = get_col_by_candidates(hist_df, HIST_PRICE_COLS) if isinstance(hist_df, pd.DataFrame) else None
-    if not col or len(pred_df) == 0:
-        return nan
-    p = pd.to_numeric(hist_df[col], errors="coerce").to_numpy(dtype=float)
-    p = p[np.isfinite(p) & (p > 0)]
-    if len(p) < 3:
-        return nan
-    sd = float(np.std(np.diff(np.log(p))[-window:], ddof=1))
-    lo, hi = float(pred_df["lower_bound"].iloc[-1]), float(pred_df["upper_bound"].iloc[-1])
-    if not (np.isfinite(lo) and np.isfinite(hi)) or sd <= 0:
-        return nan
-    half = 1.959963984540054 * sd * np.sqrt(len(pred_df))
-    honest = np.exp(half) - np.exp(-half)
-    q = ((hi - lo) / p[-1]) / honest
-    return float(q), bool(q > ratio or q < 1.0 / ratio)
+    interval = normalize_interval(interval)
+    if inputs not in ("features", "returns"):
+        raise ValueError(f"inputs must be 'features' or 'returns', not {inputs!r}")
+    if window_norm and inputs != "returns":
+        raise ValueError("window_norm needs inputs='returns': a window of mixed "
+                         "features has no single scale")
+    if size not in SIZES:
+        raise ValueError(f"size must be one of {tuple(SIZES)}, not {size!r}")
+    if look_back is not None and int(look_back) < 10:
+        raise ValueError("look_back must be at least 10")
+    print(f"--- Starting TCN Prediction ({interval}) ---")
+
+    df = df.copy()
+    df['datetime'] = pd.to_datetime(df['datetime'])
+
+    max_obs = 1000 if interval == 'daily' else 750
+    if len(df) > max_obs:
+        df = df.tail(max_obs).reset_index(drop=True)
+
+    if look_back is None:
+        look_back = 90 if interval == 'daily' else 48
+    look_back = int(look_back)
+    trainer = train_tcn_window_norm if window_norm else train_tcn
+    feature_fn = None
+    if inputs == "returns":
+        from NBeats_model import returns_only as feature_fn
+
+    results_df = forecast_nn_direct(
+        df, interval, horizon, look_back,
+        build_train_fn=lambda X, Y, od: trainer(X, Y, output_dim=od, size=size),
+        desc="TCN forecasts",
+        model_name='TCN',
+        feature_fn=feature_fn,
+        use_context=inputs == "features",
+    )
+
+    print("TCN Prediction Complete.")
+    return results_df
 ```
