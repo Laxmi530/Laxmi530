@@ -7,6 +7,7 @@
 
 - Code
   
+```
 # -----------------------------------------------------------------------------
 # 1. IMPORTS
 # -----------------------------------------------------------------------------
@@ -2215,9 +2216,4 @@ if st.session_state['submitted']:
 else:
     st.info("Select parameters and click Submit to generate forecasts.")
 
-
-
-<!---
-Laxmi530/Laxmi530 is a ✨ special ✨ repository because its `README.md` (this file) appears on your GitHub profile.
-You can click the Preview link to take a look at your changes.
---->
+```
