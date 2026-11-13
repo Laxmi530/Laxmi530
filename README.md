@@ -8,517 +8,541 @@
 - Code
   
 ```
-import pandas as pd
-import numpy as np
-import pmdarima as pm
+"""
+Denoising autoencoder over price-feature windows -> a **regime-novelty** gate.
+
+Motivated by *Hands-On Deep Learning for Finance* (Troiano et al.), Chapter 4,
+"Index Replication by Autoencoders" (and its Chapter 1 warm-up), which builds a
+vanilla autoencoder and then explores the **denoising** and **sparse** variants.
+The book's application is index replication; this module repurposes the same
+machinery for the question this project actually needs answered.
+
+Why an autoencoder here, and not as a feature transform
+-------------------------------------------------------
+The tempting use of an autoencoder in a forecasting pipeline is dimensionality
+reduction: compress the feature window to a latent code and feed that to the
+predictor. This project has already run that experiment in a different guise and
+reported the result honestly — the market-context features and excess-return
+reframing both **hurt or did nothing** (README "Empirical findings"), because at
+a 5-day single-name horizon the first moment is a random walk and extra
+representation capacity is mostly extra overfitting surface. Adding a learned
+compression in front of a model that cannot beat a random walk would be more of
+the same, so latent features ship here as an available function
+(:func:`latent_codes`) rather than as a default in any model.
+
+The genuinely useful application is the autoencoder's *other* property: an AE
+trained on one regime **reconstructs that regime well and anything else badly**.
+Reconstruction error is therefore a distribution-shift detector. That plugs
+straight into the part of this project that already carries the value — the
+serving gate. The app abstains when the data is degraded (``data_quality``) and
+when the walk-forward test says the model has no edge (``gating``); what it
+cannot currently see is *"today's market state is unlike anything this model was
+fitted on"*. A backtest-derived confidence bucket is a statement about the past
+regime; it says nothing about a novel present. That blind spot is exactly what
+this module closes.
+
+How it stays honest
+-------------------
+* **Leak-free by construction.** The AE is fitted on the earliest block of
+  windows, its reference error distribution is measured on a *held-out* middle
+  block it never saw (in-sample errors are optimistically low and would
+  exaggerate every novelty score), and only then is the most recent window
+  scored. A caller inside a walk-forward backtest passes an origin-truncated
+  frame and gets a genuinely out-of-sample novelty read.
+* **Scale-free inputs.** Windows are built from ``compute_price_features``
+  (returns, MA ratios, volatilities, RSI, z-score, acceleration) and standardized
+  on training statistics only, so the score reflects *regime shape*, not the
+  price level — a ₹100 stock and a ₹4000 stock produce comparable numbers.
+* **Never fails a run.** TensorFlow is imported lazily and every failure path
+  returns a neutral report (``verdict='unknown'``, no gate action), so enabling
+  this can only ever add information.
+"""
+
+import os
 import warnings
 
+import numpy as np
+import pandas as pd
+
 from model_utils import (
-    N_SIMS as _N_SIMS,
     normalize_interval,
     coerce_numeric_columns,
-    winsorize,
-    wilder_rsi,
-    select_best_garch,
-    simulate_price_paths,
-    generate_future_dates,
+    compute_price_features,
+    reset_keras_seeds,
+    default_keras_callbacks,
 )
 
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
+# Window of bars compressed by the autoencoder. 20 bars (~1 month daily) is long
+# enough to carry a regime's shape and short enough that ~900 rows still yield
+# ~880 training windows.
+DEFAULT_WINDOW = 20
+# Rows below which the AE is not attempted (a network on a few dozen windows
+# would report noise as novelty).
+_MIN_ROWS = 260
+# Fractions of the window sequence used to fit / to measure the reference error.
+_FIT_FRAC, _REF_FRAC = 0.70, 0.20
+# Novelty percentile thresholds -> verdict.
+_UNUSUAL_PCT, _UNPRECEDENTED_PCT = 0.95, 0.995
+_EPS = 1e-12
+
+# Columns of compute_price_features the windows are built from. Column 0 is the
+# raw adjusted close: standardised on the earliest 70% of history, a stock that
+# has since trended carries a price far outside the fit range, and the AE then
+# scores the LEVEL as a novel regime. The other eight are scale-free.
+ALL_COLUMNS = tuple(range(9))
+SCALE_FREE_COLUMNS = tuple(range(1, 9))
+
 
 # ==========================================
-# 1. Preprocessing + Exogenous Features
+# 1. Architecture (vanilla / denoising / sparse)
 # ==========================================
-def _get_exog_cols(interval, calendar=True):
+def build_autoencoder(input_dim, latent_dim=8, hidden=(64, 32), noise_std=0.1,
+                      l1_activity=0.0, dropout=0.0):
     """
-    Return the ordered list of exogenous column names for ARIMAX.
+    Build a symmetric autoencoder, optionally **denoising** and/or **sparse**.
+
+    The three variants the book walks through, exposed as arguments on one
+    architecture rather than three near-duplicate builders:
+
+    * **Vanilla** (``noise_std=0``, ``l1_activity=0``) — plain bottleneck
+      reconstruction. On financial windows it will happily learn a near-identity
+      map if the bottleneck is generous, which makes it a poor novelty detector.
+    * **Denoising** (``noise_std>0``) — Gaussian noise is injected into the input
+      *during training only* (Keras ``GaussianNoise`` is a no-op at inference),
+      and the target is the clean input. The network must therefore learn the
+      data manifold rather than a copy operation, which is precisely what makes
+      the reconstruction error of an *off-manifold* (novel-regime) window large.
+      This is the default and the reason this module works at all.
+    * **Sparse** (``l1_activity>0``) — an L1 activity penalty on the latent layer
+      forces most codes toward zero, so each unit specialises. Useful when the
+      latent code is going to be *read* (interpretability) rather than only
+      scored.
+
+    Encoder: ``input -> [GaussianNoise] -> Dense(64) -> Dense(32) ->
+    Dense(latent, relu)``. Decoder mirrors it and ends in a linear layer, because
+    the standardized inputs are unbounded (a sigmoid output would clip the tails,
+    destroying exactly the extreme windows we want to flag).
 
     Parameters
     ----------
-    interval : str
-        'daily' or 'hourly'. Hourly adds 'hour' to the feature set.
-    calendar : bool, optional
-        True (default) keeps the calendar regressors (day of week, month and,
-        hourly, hour) as plain numbers; False drops them (README section 114).
+    input_dim : int
+        Flattened window size (window * n_features).
+    latent_dim : int, optional
+        Bottleneck width. Default 8 — deliberately tight relative to a ~180-dim
+        input so the code cannot memorise.
+    hidden : tuple of int, optional
+        Encoder hidden widths (mirrored in the decoder). Default (64, 32).
+    noise_std : float, optional
+        Std of the training-time input corruption. Default 0.1.
+    l1_activity : float, optional
+        L1 penalty on the latent activations (sparse variant). Default 0.
+    dropout : float, optional
+        Dropout between encoder layers. Default 0.
 
     Returns
     -------
-    list of str
-        Ordered list of exogenous column names.
+    (tf.keras.Model, tf.keras.Model)
+        ``(autoencoder, encoder)`` — the encoder shares weights, for
+        :func:`latent_codes`.
     """
-    cols = [
-        'log_volume_ratio', 'range_hl', 'volatility',
-        'rsi', 'momentum_5', 'dayofweek', 'month',
-    ]
-    if interval == 'hourly':
-        cols.append('hour')
-    if not calendar:
-        cols = [c for c in cols if c not in _CALENDAR_EXOG]
-    return cols
+    import tensorflow as tf
+    from tensorflow.keras import layers, Model, Input, regularizers
 
+    inputs = Input(shape=(input_dim,))
+    x = inputs
+    if noise_std and noise_std > 0:
+        x = layers.GaussianNoise(noise_std)(x)
+    for h in hidden:
+        x = layers.Dense(h, activation='relu')(x)
+        if dropout:
+            x = layers.Dropout(dropout)(x)
 
-# Market-context regressors (from market_context). Added to the exogenous set
-# only when present on the (enriched) df. Like every bar statistic they enter
-# lagged one bar (_lagged_design): the contemporaneous market return would
-# explain part of today's move in-sample, shrink the residual the GARCH band is
-# fitted to, and then have to be guessed (as 0) at forecast time, so the band
-# would omit the market's own variance.
-_MARKET_EXOG = ['mkt_ret_1', 'vix_change']
+    reg = regularizers.l1(l1_activity) if l1_activity else None
+    latent = layers.Dense(latent_dim, activation='relu',
+                          activity_regularizer=reg, name='latent')(x)
 
-# Calendar regressors describe the bar being forecast and are known in
-# advance; every other regressor is a bar statistic and enters LAGGED.
-_CALENDAR_EXOG = ('dayofweek', 'month', 'hour')
+    y = latent
+    for h in reversed(hidden):
+        y = layers.Dense(h, activation='relu')(y)
+    outputs = layers.Dense(input_dim, activation='linear')(y)
 
-
-def _lagged_design(df, exog_cols):
-    """
-    Regression design for ARIMAX: return r_t on the bar statistics of t-1.
-
-    Momentum, volatility, RSI, range and the market return at bar t all
-    contain r_t itself, so regressing r_t on them is a contemporaneous fit: it
-    explains part of r_t with r_t, shrinks the residual the GARCH layer sees
-    (and with it the band), and at forecast time has nothing to feed but a
-    guessed future value. Lagging them by one bar makes every regressor known
-    at the origin, so step 1 is forecast from the actual last bar. Calendar
-    columns are the target bar's own and stay unlagged.
-
-    Returns
-    -------
-    (pd.Series, np.ndarray)
-        Log returns from the second row on, and the matching design matrix.
-    """
-    X = df[exog_cols].copy()
-    lag = [c for c in exog_cols if c not in _CALENDAR_EXOG]
-    X[lag] = X[lag].shift(1)
-    return df['log_return'].iloc[1:], X.iloc[1:].to_numpy(dtype=np.float64)
-
-
-def prepare_data(df, interval, max_obs=None):
-    """
-    Compute log returns (target) and exogenous regressors for ARIMAX.
-
-    Exogenous features include scale-invariant technical indicators
-    (log volume ratio, high-low range, rolling volatility, RSI via
-    Wilder smoothing, 5-period log momentum) and calendar variables
-    (day of week, month, hour for hourly data). Target and continuous
-    regressors are winsorized at 1st/99th percentiles.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame with datetime, open, high, low, close, adj_close, volume.
-    interval : str
-        'daily' or 'hourly'; determines whether 'hour' feature is included.
-    max_obs : int, optional
-        Maximum number of recent observations to keep. If None, use all data.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with datetime index, log_return, and exogenous columns.
-    """
-    df = df.copy()
-    df['datetime'] = pd.to_datetime(df['datetime'])
-    df = df.set_index('datetime').sort_index()
-
-    coerce_numeric_columns(df)
-
-    df['log_return'] = np.log(df['adj_close'] / df['adj_close'].shift(1))
-
-    vol_ma = df['volume'].rolling(20, min_periods=1).mean()
-    df['log_volume_ratio'] = np.log(
-        (df['volume'] / vol_ma.replace(0, 1)).clip(lower=0.01)
+    autoencoder = Model(inputs, outputs, name='denoising_autoencoder')
+    autoencoder.compile(
+        loss='mse',
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3, clipnorm=1.0),
     )
-
-    df['range_hl'] = (df['high'] - df['low']) / df['adj_close']
-
-    df['volatility'] = df['log_return'].rolling(10, min_periods=1).std()
-
-    df['rsi'] = wilder_rsi(df['adj_close'])
-
-    df['momentum_5'] = np.log(df['adj_close'] / df['adj_close'].shift(5))
-
-    df['dayofweek'] = df.index.dayofweek
-    df['month'] = df.index.month
-
-    if interval == 'hourly':
-        df['hour'] = df.index.hour
-
-    df = df.dropna(subset=['log_return'])
-    df = df[np.isfinite(df['log_return'])]
-    df = df.replace([np.inf, -np.inf], np.nan).dropna()
-
-    if max_obs and len(df) > max_obs:
-        df = df.iloc[-max_obs:]
-
-    df['log_return'] = winsorize(df['log_return'].values)
-    for col in ['log_volume_ratio', 'range_hl', 'volatility', 'momentum_5']:
-        if col in df.columns:
-            df[col] = winsorize(df[col].values)
-
-    return df
+    encoder = Model(inputs, latent, name='encoder')
+    return autoencoder, encoder
 
 
 # ==========================================
-# 2. Train ARIMAX + GARCH
+# 2. Window construction
 # ==========================================
-def train_arimax_garch(df, exog_cols):
+def feature_windows(df, window=DEFAULT_WINDOW, columns=SCALE_FREE_COLUMNS):
     """
-    Fit ARIMAX on log returns with exogenous variables and GARCH on residuals.
+    Build flattened, scale-free feature windows from a raw stock frame.
 
-    Uses auto_arima with exogenous regressors, d=0 (log returns are
-    already stationary), and BIC for model selection. Caps total ARMA
-    order at 10 to prevent overfitting. Selects the best GARCH variant
-    from an expanded search space on ARIMAX residuals.
+    Reuses ``compute_price_features`` — the matrix the sequence models train
+    on — so the autoencoder's notion of "market state" is the one the rest of
+    the project already uses, minus its raw price column (see
+    :data:`SCALE_FREE_COLUMNS`). The first 30 rows are dropped because
+    the long rolling windows are incomplete there (matching
+    ``prepare_feature_sequences``), and each window is flattened so a dense
+    autoencoder can consume it.
 
     Parameters
     ----------
     df : pd.DataFrame
-        DataFrame with 'log_return' and exogenous columns (from prepare_data).
-    exog_cols : list of str
-        Ordered list of exogenous column names.
+        Raw stock DataFrame with 'datetime' and 'adj_close'.
+    window : int, optional
+        Bars per window. Default 20.
+    columns : tuple of int, optional
+        Columns of ``compute_price_features`` to use. Default the eight
+        scale-free ones; :data:`ALL_COLUMNS` restores the raw price.
 
     Returns
     -------
-    tuple of (ARIMA, ARCHModelResult)
-        arimax_model : fitted pmdarima ARIMAX model.
-        garch_model : fitted GARCH volatility model.
+    (np.ndarray, np.ndarray, int)
+        ``(X, timestamps, n_features)`` where ``X`` has shape
+        (n_windows, window * n_features) and ``timestamps[i]`` is the last bar of
+        window ``i``. Returns empty arrays when there is too little history.
     """
-    print("--- Training ARIMAX + GARCH ---")
+    d = df.copy()
+    d['datetime'] = pd.to_datetime(d['datetime'])
+    d = d.set_index('datetime').sort_index()
+    coerce_numeric_columns(d)
 
-    returns, exog = _lagged_design(df, exog_cols)
+    prices = d['adj_close'].dropna()
+    if len(prices) < window + 40:
+        return np.array([]), np.array([]), 0
 
-    print("Fitting Auto-ARIMAX with exogenous regressors...")
-    # pmdarima >= 2.0 takes the regressors as ``X``. It silently swallowed the
-    # old ``exogenous=`` keyword, so until this was fixed "ARIMAX" fitted no
-    # regressors at all and was plain ARIMA on the same returns.
-    arimax_model = pm.auto_arima(
-        returns,
-        X=exog,
-        start_p=0, start_q=0,
-        max_p=5, max_q=5,
-        max_order=10,
-        d=0,
-        seasonal=False,
-        information_criterion='bic',
-        stepwise=True,
-        suppress_warnings=True,
-        error_action='ignore',
-        trace=False,
-    )
-    print(f"Best ARIMAX Order: {arimax_model.order}")
+    idx = prices.index
+    feats = compute_price_features(prices.values.astype(np.float64))
+    feats = feats[:, list(columns)]
+    # Drop the rolling-window warmup rows (30 = the long SMA/vol window).
+    feats, idx = feats[30:], idx[30:]
+    n_features = feats.shape[1]
 
-    residuals = arimax_model.resid()
+    n_win = len(feats) - window + 1
+    if n_win < 40:
+        return np.array([]), np.array([]), n_features
 
-    print("Selecting best volatility model for residuals...")
-    garch_model = select_best_garch(residuals)
-
-    return arimax_model, garch_model
+    X = np.stack([feats[i:i + window].reshape(-1) for i in range(n_win)])
+    stamps = np.asarray(idx[window - 1:])
+    return X.astype(np.float64), stamps, n_features
 
 
 # ==========================================
-# 3. Future Exogenous Generation
+# 3. Fit + score
 # ==========================================
-def _build_future_exog(df, future_dates, exog_cols, interval, centre=False):
+def fit_regime_autoencoder(df, interval='1d', window=DEFAULT_WINDOW,
+                           latent_dim=8, noise_std=0.1, l1_activity=0.0,
+                           epochs=150, batch_size=32, verbose=False,
+                           columns=SCALE_FREE_COLUMNS):
     """
-    Construct the exogenous matrix for the forecast horizon.
+    Fit the denoising AE and measure its held-out reconstruction-error baseline.
 
-    The bar statistics enter the regression lagged one bar
-    (:func:`_lagged_design`), so the regressors for step 1 are the **actual**
-    values at the last observed bar; later steps need values of bars not yet
-    seen and decay from there toward a neutral level (weight ``0.9**(k-1)``
-    at step k):
+    Three temporal blocks, in order, with no shuffling across them:
 
-    - log_volume_ratio : decay toward 0.0 (= average volume, since log(1) = 0)
-    - range_hl : decay toward its long-term median
-    - volatility : decay toward its long-term median
-    - rsi : decay toward 50 (neutral equilibrium)
-    - momentum_5 : decay toward 0 (no trend assumption)
-    - dayofweek : exact from calendar
-    - month : exact from calendar
-    - hour : exact from calendar (hourly only)
-    - market regressors : decay toward 0
+    1. **Fit block** (earliest 70% of windows) — trains the AE. The scaler's
+       mean/std come from this block only.
+    2. **Reference block** (next 20%) — never trained on. Its reconstruction
+       errors form the baseline distribution that every later score is compared
+       against. Using in-sample errors here would be the classic mistake: they
+       are systematically too small, so *everything* subsequent would look novel.
+    3. **Score block** (final 10%, plus whatever the caller scores later) — the
+       recent windows whose novelty we actually care about.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Historical data with exogenous columns (from prepare_data).
-    future_dates : list of datetime
-        Future dates for the forecast horizon.
-    exog_cols : list of str
-        Ordered list of exogenous column names.
-    interval : str
-        'daily' or 'hourly'; determines whether 'hour' is included.
-    centre : bool, optional
-        False (default): the neutral levels above. True: every bar statistic
-        decays toward its mean over the training rows instead, the assumed
-        future value of Hyndman and Athanasopoulos, Forecasting: Principles
-        and Practice, section 10.3 (README section 114). With no intercept in
-        the model, a neutral level that differs from the training mean adds
-        a drift of the coefficient times the difference at every step.
+        Raw stock DataFrame with 'datetime' and 'adj_close'.
+    interval : str, optional
+        '1d'/'daily' or '1h'/'hourly' (recorded in the result; the window is in
+        bars either way).
+    window : int, optional
+        Bars per window. Default 20.
+    latent_dim : int, optional
+        Bottleneck width. Default 8.
+    noise_std : float, optional
+        Denoising corruption level. Default 0.1 (0 = vanilla AE).
+    l1_activity : float, optional
+        Latent L1 penalty (sparse AE). Default 0.
+    epochs, batch_size : int, optional
+        Training budget. Defaults 150 / 32 (early stopping usually fires first).
+    verbose : bool, optional
+        Print the Keras training log. Default False.
+
+    Returns
+    -------
+    dict or None
+        A bundle with keys ``autoencoder``, ``encoder``, ``mu``, ``sd``,
+        ``window``, ``n_features``, ``ref_errors`` (the held-out baseline),
+        ``score_errors`` / ``score_stamps`` (the recent block), and
+        ``ref_quantiles``. Returns None when there is too little history or
+        TensorFlow is unavailable.
+    """
+    interval = normalize_interval(interval)
+    X, stamps, n_features = feature_windows(df, window=window, columns=columns)
+    if len(X) == 0 or len(X) < _MIN_ROWS // 4:
+        print(f"autoencoder_regime: only {len(X)} windows — skipping the AE.")
+        return None
+
+    n = len(X)
+    n_fit = int(n * _FIT_FRAC)
+    n_ref = max(20, int(n * _REF_FRAC))
+    n_fit = min(n_fit, n - n_ref - 5)
+    if n_fit < 60:
+        print("autoencoder_regime: too few fit windows — skipping the AE.")
+        return None
+
+    fit_block = X[:n_fit]
+    ref_block = X[n_fit:n_fit + n_ref]
+    score_block = X[n_fit + n_ref:]
+    score_stamps = stamps[n_fit + n_ref:]
+
+    mu = fit_block.mean(axis=0)
+    sd = fit_block.std(axis=0)
+    sd = np.where(sd < 1e-8, 1.0, sd)
+
+    def _scale(a):
+        return (a - mu) / sd
+
+    try:
+        reset_keras_seeds()
+        ae, enc = build_autoencoder(
+            X.shape[1], latent_dim=latent_dim, noise_std=noise_std,
+            l1_activity=l1_activity,
+        )
+        Z = _scale(fit_block)
+        # Last 10% of the fit block is the Keras validation split for early
+        # stopping — temporally the most recent part of the fit block, so the
+        # stopping signal is not measured on windows the AE has already memorised
+        # from an earlier era.
+        val = max(1, int(len(Z) * 0.1))
+        ae.fit(Z[:-val], Z[:-val],
+               validation_data=(Z[-val:], Z[-val:]),
+               epochs=epochs, batch_size=batch_size, shuffle=True,
+               callbacks=default_keras_callbacks(patience=12, lr_patience=6),
+               verbose=1 if verbose else 0)
+    except Exception as exc:
+        print(f"autoencoder_regime: AE fit failed ({exc}); novelty unavailable.")
+        return None
+
+    ref_errors = reconstruction_error(ae, _scale(ref_block))
+    score_errors = (reconstruction_error(ae, _scale(score_block))
+                    if len(score_block) else np.array([]))
+
+    if len(ref_errors):
+        q = np.quantile(ref_errors, [0.5, 0.9, 0.95, 0.99])
+        ref_q = dict(zip(['p50', 'p90', 'p95', 'p99'], [float(v) for v in q]))
+        print(f"autoencoder_regime: AE fitted on {len(fit_block)} windows; "
+              f"held-out error median {ref_q['p50']:.4f} (p95 {ref_q['p95']:.4f})")
+    else:
+        ref_q = {}
+        print("autoencoder_regime: AE fitted (no reference block available)")
+
+    return {
+        'autoencoder': ae,
+        'encoder': enc,
+        'mu': mu,
+        'sd': sd,
+        'window': int(window),
+        'columns': tuple(columns),
+        'interval': interval,
+        'n_features': int(n_features),
+        'n_fit': int(len(fit_block)),
+        'ref_errors': ref_errors,
+        'ref_quantiles': ref_q,
+        'score_errors': score_errors,
+        'score_stamps': score_stamps,
+    }
+
+
+def reconstruction_error(autoencoder, X_scaled):
+    """
+    Per-window mean squared reconstruction error.
+
+    The novelty score itself. Mean (not sum) so it is comparable across window
+    sizes, and per-window (not pooled) so a caller can plot it as a time series
+    and see *when* the regime drifted.
+    """
+    if len(X_scaled) == 0:
+        return np.array([])
+    recon = np.asarray(autoencoder.predict(X_scaled, verbose=0))
+    return np.mean((np.asarray(X_scaled) - recon) ** 2, axis=1)
+
+
+def latent_codes(bundle, df=None, X=None):
+    """
+    Encode windows into the AE's latent space.
+
+    Provided for experimentation — compressed regime codes are a legitimate
+    feature set for a *cross-sectional* or regime-conditioned model. It is
+    deliberately **not** wired into any forecaster here: this project's own A/B
+    evidence is that extra representation capacity does not improve single-name
+    absolute-price forecasts at these horizons, and shipping an unvalidated
+    feature transform would contradict that finding.
+
+    Parameters
+    ----------
+    bundle : dict
+        Output of :func:`fit_regime_autoencoder`.
+    df : pd.DataFrame, optional
+        Frame to encode (windows are rebuilt with the bundle's window size).
+    X : np.ndarray, optional
+        Pre-built unscaled windows, used instead of ``df`` when given.
 
     Returns
     -------
     np.ndarray
-        Exogenous matrix of shape (horizon, len(exog_cols)) with
-        dtype float64.
+        (n_windows, latent_dim) codes; empty if nothing could be encoded.
     """
-    last = df.iloc[-1]
-    long_term_range_hl = float(df['range_hl'].median())
-    long_term_vol = float(df['volatility'].median())
-    neutral = {'log_volume_ratio': 0.0, 'range_hl': long_term_range_hl,
-               'volatility': long_term_vol, 'rsi': 50.0, 'momentum_5': 0.0}
-    if centre:
-        neutral = {c: float(df[c].mean()) for c in neutral}
-
-    rows = []
-    for i, dt in enumerate(future_dates):
-        # Step 1 (i = 0) regresses on the last observed bar itself: weight 1.
-        weight = 0.9 ** i
-
-        row = {c: float(last[c]) * weight + neutral[c] * (1 - weight) for c in neutral}
-        row['dayofweek'] = dt.dayofweek
-        row['month'] = dt.month
-        if interval == 'hourly':
-            row['hour'] = dt.hour
-
-        # Any extra exog (e.g. market-context regressors) starts from its last
-        # observed value and decays to its expected future value of 0.
-        for col in exog_cols:
-            if col not in row:
-                v = float(last[col]) if col in df.columns else 0.0
-                m = float(df[col].mean()) if (centre and col in df.columns) else 0.0
-                m = m if np.isfinite(m) else 0.0
-                row[col] = (v if np.isfinite(v) else 0.0) * weight + m * (1 - weight)
-
-        rows.append(row)
-
-    return np.array(pd.DataFrame(rows)[exog_cols], dtype=np.float64)
+    if bundle is None:
+        return np.array([])
+    if X is None:
+        if df is None:
+            return np.array([])
+        X, _, _ = feature_windows(df, window=bundle['window'],
+                                  columns=bundle.get('columns', SCALE_FREE_COLUMNS))
+    if len(X) == 0:
+        return np.array([])
+    Z = (X - bundle['mu']) / bundle['sd']
+    return np.asarray(bundle['encoder'].predict(Z, verbose=0))
 
 
 # ==========================================
-# 4. Monte Carlo Simulation
+# 4. The gate-facing report
 # ==========================================
-def _simulate_price_paths(arimax_model, garch_model, last_price, horizon,
-                          future_exog, method='simulation'):
+def regime_novelty(df, interval='1d', window=DEFAULT_WINDOW, bundle=None,
+                   **fit_kwargs):
     """
-    Monte Carlo simulation of future price paths for ARIMAX+GARCH.
+    Score how unlike its training history the **latest** market window is.
 
-    Computes the ARIMAX deterministic mean forecast (conditioned on the
-    estimated future exogenous variables) and delegates to the shared
-    GARCH path simulator.
+    This is the function the serving layer calls. It fits (or reuses) the AE,
+    reconstructs the most recent window, and expresses the error as a percentile
+    of the held-out reference distribution:
+
+    * ``< 95th`` -> ``'familiar'`` — the current regime looks like what the
+      models were fitted on; the usual confidence machinery applies.
+    * ``95th-99.5th`` -> ``'unusual'`` — a caller should widen the cone and treat
+      the directional call with extra suspicion.
+    * ``> 99.5th`` -> ``'unprecedented'`` — the state is off-manifold. Every
+      model's backtest-derived confidence bucket is an extrapolation here, so the
+      honest action is to withhold the directional call and show the risk cone
+      only (see ``gating.apply_novelty_gate``).
+
+    ``cone_multiplier`` is a modest, bounded suggestion (1.0-1.5) for scaling an
+    uncertainty band, derived from the error ratio. It is intentionally *not*
+    applied automatically anywhere: the HAR-RV/Vol-LSTM cones are conformally
+    calibrated, and silently multiplying a calibrated interval by an
+    uncalibrated factor would break the very guarantee that makes it useful.
+    Treat it as a research knob to A/B, in the same spirit as the India-VIX tilt.
 
     Parameters
     ----------
-    arimax_model : pmdarima.ARIMA
-        Fitted ARIMAX model for mean return forecasts.
-    garch_model : arch.univariate.base.ARCHModelResult
-        Fitted GARCH volatility model (mean='Zero').
-    last_price : float
-        Last observed adjusted close price.
-    horizon : int
-        Number of steps to simulate.
-    future_exog : np.ndarray
-        Exogenous matrix of shape (horizon, n_features) for the ARIMAX
-        mean forecast.
+    df : pd.DataFrame
+        Raw stock DataFrame with 'datetime' and 'adj_close'.
+    interval : str, optional
+        '1d'/'daily' or '1h'/'hourly'.
+    window : int, optional
+        Bars per window. Default 20.
+    bundle : dict, optional
+        A previously fitted bundle from :func:`fit_regime_autoencoder`, to avoid
+        refitting (e.g. across several models in one request).
+    **fit_kwargs
+        Forwarded to :func:`fit_regime_autoencoder`.
 
     Returns
     -------
     dict
-        'predicted_price', 'lower_bound', 'upper_bound', 'volatility' arrays.
+        {'available', 'verdict', 'error', 'percentile', 'ratio_to_p50',
+         'cone_multiplier', 'reference', 'asof', 'note'}. On any failure:
+        ``available=False``, ``verdict='unknown'`` and a populated ``note`` —
+        never an exception.
     """
-    arimax_mean = arimax_model.predict(n_periods=horizon, X=future_exog)
-    return simulate_price_paths(arimax_mean, garch_model, last_price, horizon,
-                                method=method)
+    neutral = {'available': False, 'verdict': 'unknown', 'error': float('nan'),
+               'percentile': float('nan'), 'ratio_to_p50': float('nan'),
+               'cone_multiplier': 1.0, 'reference': {}, 'asof': None, 'note': ''}
+
+    try:
+        if bundle is None:
+            bundle = fit_regime_autoencoder(df, interval=interval,
+                                            window=window, **fit_kwargs)
+        if bundle is None:
+            return {**neutral, 'note': 'insufficient history for the autoencoder'}
+
+        X, stamps, _ = feature_windows(
+            df, window=bundle['window'],
+            columns=bundle.get('columns', SCALE_FREE_COLUMNS))
+        if len(X) == 0:
+            return {**neutral, 'note': 'no usable feature windows'}
+
+        Z = (X[-1:] - bundle['mu']) / bundle['sd']
+        err = float(reconstruction_error(bundle['autoencoder'], Z)[0])
+
+        ref = np.asarray(bundle['ref_errors'], dtype=np.float64)
+        if len(ref) < 10:
+            return {**neutral, 'error': err,
+                    'note': 'reference error distribution too small'}
+
+        pct = float(np.mean(ref <= err))
+        p50 = float(np.median(ref))
+        ratio = float(err / p50) if p50 > _EPS else float('nan')
+
+        if pct > _UNPRECEDENTED_PCT:
+            verdict = 'unprecedented'
+        elif pct > _UNUSUAL_PCT:
+            verdict = 'unusual'
+        else:
+            verdict = 'familiar'
+
+        # Bounded widening suggestion: sqrt of the error ratio (errors are in
+        # squared units, bands are in sigma units), clipped to [1.0, 1.5] so a
+        # single freak window can never blow the cone up.
+        mult = 1.0
+        if np.isfinite(ratio) and ratio > 1.0:
+            mult = float(np.clip(np.sqrt(ratio), 1.0, 1.5))
+
+        return {
+            'available': True,
+            'verdict': verdict,
+            'error': err,
+            'percentile': round(pct, 4),
+            'ratio_to_p50': round(ratio, 3) if np.isfinite(ratio) else float('nan'),
+            'cone_multiplier': round(mult, 3),
+            'reference': bundle.get('ref_quantiles', {}),
+            'asof': (pd.Timestamp(stamps[-1]).isoformat()
+                     if len(stamps) else None),
+            'note': '',
+        }
+    except Exception as exc:                     # novelty is advisory, never fatal
+        return {**neutral, 'note': f'novelty check failed: {str(exc)[:120]}'}
 
 
-# ==========================================
-# 5. Forecast Generation
-# ==========================================
-def generate_forecasts(df, arimax_model, garch_model, exog_cols, horizon,
-                       interval, centre=False, method='simulation'):
+def novelty_series(bundle):
     """
-    Generate future price forecasts via Monte Carlo simulation.
+    The recent-block novelty scores as a tidy time series, for plotting.
 
-    Simulates thousands of return paths through the fitted ARIMAX+GARCH
-    dynamics conditioned on estimated future exogenous variables, then
-    extracts empirical percentiles for point forecasts and 95% confidence
-    intervals. This approach naturally respects fat tails, skewness,
-    and path-dependent volatility clustering from the fitted GARCH
-    innovation distribution.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Prepared DataFrame with adj_close, exogenous columns, datetime index.
-    arimax_model : pmdarima.ARIMA
-        Fitted ARIMAX model.
-    garch_model : arch.univariate.base.ARCHModelResult
-        Fitted GARCH volatility model.
-    exog_cols : list of str
-        Ordered list of exogenous column names.
-    horizon : int
-        Number of steps to forecast.
-    interval : str
-        'daily' or 'hourly'; affects date generation and exogenous logic.
+    Returns the held-out *score block* errors alongside their timestamps and the
+    reference percentile of each, so a caller can show "when did this stock's
+    regime drift?" rather than only the latest scalar.
 
     Returns
     -------
     pd.DataFrame
-        DataFrame with columns ['datetime', 'predicted_price', 'lower_bound',
-        'upper_bound', 'volatility'].
+        Columns ['datetime', 'error', 'percentile'] (empty if unavailable).
     """
-    last_price = df['adj_close'].iloc[-1]
-    last_date = df.index[-1]
-
-    future_dates = generate_future_dates(last_date, horizon, interval)
-    future_exog = _build_future_exog(df, future_dates, exog_cols, interval, centre=centre)
-
-    print(f"Simulating {_N_SIMS} price paths for {horizon} steps...")
-    sim = _simulate_price_paths(
-        arimax_model, garch_model, last_price, horizon, future_exog,
-        method=method,
-    )
-
-    future_data = []
-    for i in range(horizon):
-        future_data.append({
-            'datetime': future_dates[i],
-            'predicted_price': sim['predicted_price'][i],
-            'lower_bound': sim['lower_bound'][i],
-            'upper_bound': sim['upper_bound'][i],
-            'volatility': sim['volatility'][i],
-        })
-
-    return pd.DataFrame(future_data)
-
-
-# ==========================================
-# 6. Main Orchestrator
-# ==========================================
-def _train_no_exog(df):
-    """ARIMA + GARCH on ARIMAX's prepared returns, with no regressors at all."""
-    print("--- Training ARIMA + GARCH (ARIMAX data, no regressors) ---")
-    model = pm.auto_arima(
-        df['log_return'], start_p=0, start_q=0, max_p=5, max_q=5,
-        max_order=10, d=0, seasonal=False, information_criterion='bic',
-        stepwise=True, suppress_warnings=True, error_action='ignore',
-        trace=False,
-    )
-    print(f"Best ARIMA Order: {model.order}")
-    return model, select_best_garch(model.resid())
-
-
-#: The configuration before section 114, which every run keeps unless a switch
-#: is given: neutral future regressor levels, the calendar regressors as plain
-#: numbers, and shocks drawn from the fitted distribution.
-ARIMAX_LEGACY = dict(centre=False, calendar=True, fhs=False)
-
-
-def resolve_switches(interval, horizon, centre=None, calendar=None, fhs=None):
-    """
-    The switches a run uses. A switch left as None takes ARIMAX_LEGACY's value;
-    an explicit value is kept. ``interval`` and ``horizon`` are taken so a
-    horizon-dependent default can be added without changing callers.
-    """
-    given = dict(centre=centre, calendar=calendar, fhs=fhs)
-    return {k: ARIMAX_LEGACY[k] if v is None else bool(v) for k, v in given.items()}
-
-
-def arimax_paths(df, interval, horizon, calendar=True, variants=((False, False),)):
-    """
-    Forecast paths for several (centre, fhs) settings from one fit:
-    {(centre, fhs): DataFrame}. ``calendar`` changes the regressors, so it is
-    fixed for the call; ``centre`` changes only the assumed future regressors
-    and ``fhs`` only the simulated shocks.
-    """
-    interval = normalize_interval(interval)
-    exog_cols = _get_exog_cols(interval, calendar=calendar)
-    max_obs = 750 if interval == 'daily' else 500
-    clean_df = prepare_data(df, interval, max_obs=max_obs)
-
-    # Add market-context regressors when the df was enriched (graceful no-op
-    # otherwise). prepare_data carries them through unchanged.
-    market_exog = [c for c in _MARKET_EXOG if c in clean_df.columns]
-    if market_exog:
-        exog_cols = exog_cols + market_exog
-        print(f"ARIMAX using market-context regressors: {market_exog}")
-
-    arimax, garch = train_arimax_garch(clean_df, exog_cols)
-    return {(bool(c), bool(f)): generate_forecasts(
-                clean_df, arimax, garch, exog_cols, horizon, interval,
-                centre=bool(c), method='bootstrap' if f else 'simulation')
-            for c, f in variants}
-
-
-def run_arimax_prediction(df: pd.DataFrame, interval: str, horizon: int,
-                          use_exog=True, centre=None, calendar=None, fhs=None):
-    """
-    Main function to run ARIMAX + GARCH prediction.
-
-    ``use_exog=False`` fits the same pipeline with no regressors. That is
-    exactly what this function did before the regressors were passed to
-    pmdarima correctly (README §59), so it reproduces every figure published
-    for "ARIMAX" before then; the meta-ensemble uses it for that reason.
-
-    Orchestrates exogenous feature engineering (including RSI via
-    Wilder smoothing and scale-invariant technical indicators),
-    ARIMAX model fitting with complexity cap, GARCH volatility
-    modelling from an expanded candidate search, and Monte Carlo
-    forecast generation with distribution-aware confidence intervals.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Raw stock DataFrame with columns datetime, open, high, low,
-        close, adj_close, volume.
-    interval : str
-        '1d' / 'daily' / '1 Day' or '1h' / 'hourly' / '1 Hour'.
-    horizon : int
-        Number of future steps to predict.
-    use_exog : bool, optional
-        False fits no regressors (see above). Its shocks are drawn from the
-        fitted distribution unless ``fhs=True`` is given explicitly, whatever
-        the defaults below, so the meta-ensemble's member does not change.
-    centre, calendar, fhs : bool or None, optional
-        None (default) takes ARIMAX_LEGACY (README section 114). ``centre``:
-        future bar statistics decay toward their training means rather than
-        fixed neutral levels. ``calendar=False`` drops the day-of-week, month
-        and hour regressors. ``fhs``: shocks drawn from the model's own
-        standardized residuals (filtered historical simulation).
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with columns ['datetime', 'predicted_price',
-        'lower_bound', 'upper_bound', 'volatility'].
-    """
-    interval = normalize_interval(interval)
-    print(f"--- Starting ARIMAX Prediction ({interval}) ---")
-
-    if not use_exog:
-        method = 'bootstrap' if fhs else 'simulation'
-        max_obs = 750 if interval == 'daily' else 500
-        clean_df = prepare_data(df, interval, max_obs=max_obs)
-        model, garch = _train_no_exog(clean_df)
-        last_price = clean_df['adj_close'].iloc[-1]
-        future_dates = generate_future_dates(clean_df.index[-1], horizon, interval)
-        print(f"Simulating {_N_SIMS} price paths for {horizon} steps...")
-        sim = simulate_price_paths(model.predict(n_periods=horizon), garch,
-                                   last_price, horizon, method=method)
-        return pd.DataFrame([{
-            'datetime': future_dates[i],
-            'predicted_price': sim['predicted_price'][i],
-            'lower_bound': sim['lower_bound'][i],
-            'upper_bound': sim['upper_bound'][i],
-            'volatility': sim['volatility'][i],
-        } for i in range(horizon)])
-
-    sw = resolve_switches(interval, horizon, centre, calendar, fhs)
-    v = (sw['centre'], sw['fhs'])
-    results_df = arimax_paths(df, interval, horizon, calendar=sw['calendar'], variants=(v,))[v]
-    print("ARIMAX Prediction Complete.")
-    return results_df
+    if not bundle or len(bundle.get('score_errors', [])) == 0:
+        return pd.DataFrame(columns=['datetime', 'error', 'percentile'])
+    ref = np.asarray(bundle['ref_errors'], dtype=np.float64)
+    errs = np.asarray(bundle['score_errors'], dtype=np.float64)
+    pct = ([float(np.mean(ref <= e)) for e in errs] if len(ref) >= 10
+           else [float('nan')] * len(errs))
+    return pd.DataFrame({'datetime': pd.to_datetime(bundle['score_stamps']),
+                         'error': errs, 'percentile': pct})
 ```
