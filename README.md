@@ -10,286 +10,296 @@
 ```
 import pandas as pd
 import numpy as np
-import lightgbm as lgb
+from statsmodels.tsa.regime_switching.markov_autoregression import (
+    MarkovAutoregression,
+)
 import warnings
+
+from model_utils import (
+    N_SIMS as _N_SIMS,
+    normalize_interval,
+    prepare_log_returns,
+    generate_future_dates,
+)
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
-
-from model_utils import normalize_interval, generate_future_dates, lgb_threads
-from ML_model import create_features
-from direct_forecast import (
-    horizon_feature_cols, make_horizon_targets, training_frame,
-    compute_origin_row, conformal_calibration,
-)
-
-_QUANTILES = [0.025, 0.5, 0.975]
-_ALPHA = 0.05
-
-#: Every switch off: the model as validated before README section 111, which
-#: every run keeps unless a switch is passed (section 111 tests the switches).
-QUANTILE_LEGACY = dict(leaf_scale=False, shrink=False, cqr=False)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 
 # ==========================================
-# 1. Build Quantile LightGBM Models
+# 1. Fit Markov Switching Model
 # ==========================================
-def _build_quantile_lgb(alpha, min_child_samples=20):
+#: Seeds for statsmodels' random restart search, tried in turn (see below).
+_SEARCH_SEEDS = (12345, 2024, 7)
+
+
+def _fit_markov_switching(returns, k_regimes=2, order=2):
     """
-    Create a LightGBM regressor configured for quantile loss.
+    Fit a Markov Switching Autoregression on log returns.
+
+    Tries the requested order first, then falls back to simpler
+    specifications if optimisation fails. The model captures
+    regime-dependent means and variances (e.g., low-volatility
+    vs high-volatility regimes), which is critical for financial
+    time series that exhibit bull/bear market transitions.
 
     Parameters
     ----------
-    alpha : float
-        Target quantile in (0, 1). For example 0.5 gives the median,
-        0.025 gives the 2.5th percentile (lower bound of 95 % CI).
-    min_child_samples : int, optional
-        Minimum rows per leaf. Default 20 (the shipped model).
+    returns : pd.Series
+        Log return series.
+    k_regimes : int, optional
+        Number of hidden regimes. Default 2.
+    order : int, optional
+        Autoregressive order within each regime. Default 2.
 
     Returns
     -------
-    lgb.LGBMRegressor
-        Configured but unfitted LightGBM model.
+    statsmodels.tsa.regime_switching.markov_autoregression.MarkovAutoregressionResultsWrapper
+        Fitted model results.
+
+    Raises
+    ------
+    RuntimeError
+        If all attempted specifications fail to converge.
     """
-    return lgb.LGBMRegressor(
-        objective='quantile',
-        alpha=alpha,
-        n_estimators=1200,
-        learning_rate=0.03,
-        num_leaves=31,
-        subsample=0.8,
-        subsample_freq=1,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
-        min_child_samples=int(min_child_samples),
-        random_state=42,
-        verbose=-1,
-        **lgb_threads(),
-    )
+    ret_values = returns.values.astype(np.float64)
 
-
-# ==========================================
-# 2. Train Three Quantile Models
-# ==========================================
-def train_quantile_models(features_df, target_col, test_size=0.1,
-                          min_child_samples=20):
-    """
-    Train three LightGBM models for the 2.5th, 50th, and 97.5th quantiles.
-
-    Each model independently optimises quantile loss (pinball loss) for
-    its target percentile.  A temporal train/test split avoids look-ahead
-    bias, and early stopping prevents overfitting.
-
-    Parameters
-    ----------
-    features_df : pd.DataFrame
-        Engineered features DataFrame (datetime-indexed) with a target
-        column and raw OHLCV columns.
-    target_col : str
-        Name of the target column (e.g., 'target_log_return').
-    test_size : float, optional
-        Fraction of data for temporal validation. Default 0.1.
-    min_child_samples : int, optional
-        Minimum rows per leaf for all three models. Default 20.
-
-    Returns
-    -------
-    models : dict
-        Mapping of quantile float -> fitted LGBMRegressor.
-    feature_cols : list of str
-        Ordered list of feature column names used during training.
-    """
-    raw_cols = {'open', 'high', 'low', 'close', 'adj_close', 'volume'}
-    feature_cols = [
-        c for c in features_df.columns
-        if c != target_col and c not in raw_cols
-    ]
-
-    X = features_df[feature_cols]
-    y = features_df[target_col]
-
-    split_idx = int(len(X) * (1 - test_size))
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
-
-    models = {}
-
-    for q in _QUANTILES:
-        label = f"Q{q:.3f}"
-        print(f"Training LightGBM {label}...")
-
-        model = _build_quantile_lgb(q, min_child_samples)
-        callbacks = [
-            lgb.early_stopping(stopping_rounds=50, verbose=False),
-            lgb.log_evaluation(0),
-        ]
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_test, y_test)],
-            eval_metric='quantile',
-            callbacks=callbacks,
-        )
-        models[q] = model
-
-    print(f"Quantile training complete (features: {len(feature_cols)})")
-    return models, feature_cols
-
-
-# ==========================================
-# 3. Switches (README section 111)
-# ==========================================
-def resolve_switches(interval, horizon, leaf_scale=None, shrink=None, cqr=None):
-    """
-    The switches a run uses. A switch left as None takes QUANTILE_LEGACY (all
-    off); an explicit True or False is kept. ``interval`` and ``horizon`` are
-    taken so that a horizon-split default can be added here if one ships.
-    """
-    given = dict(leaf_scale=leaf_scale, shrink=shrink, cqr=cqr)
-    return {k: QUANTILE_LEGACY[k] if v is None else bool(v) for k, v in given.items()}
-
-
-def min_leaf(h, n_rows):
-    """``leaf_scale``'s rows per leaf: at least min(20 h, a fifth of the rows)."""
-    return int(max(20, min(20 * h, n_rows // 5)))
-
-
-def adjust_quantiles(q_origin, cal, shrink, cqr, alpha=_ALPHA):
-    """
-    One step's (lower, median, upper) cumulative log returns after the switches.
-
-    ``q_origin`` holds the three models' forecasts at the origin; ``cal`` is
-    ``(y, P)`` from the calibration block (realised returns and an (m, 3)
-    array of the calibration models' quantiles), or None. Both are sorted, so
-    the quantiles never cross (the rearrangement of Chernozhukov,
-    Fernandez-Val and Galichon, Econometrica 2010).
-
-    * ``shrink``: the three quantiles move together by -(1 - beta) times the
-      median, beta = clip(sum(p y) / sum(p p), 0, 1) from the calibration
-      block's medians p (as ``ML_model``'s shrink; Campbell and Thompson 2008).
-    * ``cqr``: conformalized quantile regression (Romano, Patterson and
-      Candes, NeurIPS 2019): the scores E = max(lo - y, y - hi) on the
-      calibration block, Q their finite-sample (1 - alpha) quantile, and the
-      band [lo - Q, hi + Q]. Q is negative when the raw band over-covers, so
-      the band can also narrow; it never crosses the median.
-
-    With both off, or no calibration block, the sorted quantiles are returned
-    unchanged.
-    """
-    lo, mid, hi = (float(v) for v in np.sort(np.asarray(q_origin, dtype=float)))
-    if cal is None or not (shrink or cqr):
-        return lo, mid, hi
-    y, P = cal
-    y = np.asarray(y, dtype=float)
-    P = np.sort(np.asarray(P, dtype=float), axis=1)
-    if shrink:
-        p = P[:, 1]
-        den = float(np.sum(p * p))
-        beta = float(np.clip(np.sum(p * y) / den, 0.0, 1.0)) if den > 0 else 0.0
-        shift = (1.0 - beta) * mid
-        lo, mid, hi = lo - shift, mid - shift, hi - shift
-        P = P - ((1.0 - beta) * p)[:, None]
-    if cqr:
-        E = np.maximum(P[:, 0] - y, y - P[:, 2])
-        m = len(E)
-        q_level = min(1.0, np.ceil((m + 1) * (1 - alpha)) / m)
-        Q = float(np.quantile(E, q_level))
-        lo, hi = min(lo - Q, mid), max(hi + Q, mid)
-    return lo, mid, hi
-
-
-def quantile_paths(df, interval, horizon, leaf_scale=False, variants=((False, False),)):
-    """
-    Forecasts for several ``(shrink, cqr)`` settings from one set of fits.
-
-    Returns ``{(shrink, cqr): DataFrame}``. The calibration models (fit on the
-    training rows before the most recent 20%, with ``h`` rows purged between,
-    as ``direct_forecast.conformal_calibration``) are trained only when a
-    variant needs them. ``run_quantile_prediction`` is this with one variant.
-    """
-    interval = normalize_interval(interval)
-    variants = [(bool(s), bool(c)) for s, c in variants]
-
-    df = df.copy()
-    max_obs = 1000 if interval == 'daily' else 750
-    if len(df) > max_obs:
-        df = df.iloc[-max_obs:]
-
-    features_df = create_features(df, interval)
-    feature_cols = horizon_feature_cols(features_df)
-    targets = make_horizon_targets(features_df, horizon)
-
-    origin_X, last_price, last_date = compute_origin_row(
-        df, feature_cols, interval,
-    )
-    future_dates = generate_future_dates(last_date, horizon, interval)
-    need_cal = any(s or c for s, c in variants)
-
-    print(f"Training {horizon} direct quantile horizon models...")
-
-    rows = {v: [] for v in variants}
-    for i, h in enumerate(range(1, horizon + 1)):
-        target_name = f'target_h{h}'
-        train_df = training_frame(
-            features_df, feature_cols, targets[h], target_name,
-        )
-        mcs = min_leaf(h, len(train_df)) if leaf_scale else 20
-        models, _ = train_quantile_models(train_df, target_name, min_child_samples=mcs)
-        q_origin = [float(models[q].predict(origin_X)[0]) for q in _QUANTILES]
-
-        cal = None
-        if need_cal:
-            def _fit_predict(proper_df, X_cal, _tn=target_name, _mcs=mcs):
-                m, _ = train_quantile_models(proper_df, _tn, min_child_samples=_mcs)
-                return np.column_stack([m[q].predict(X_cal) for q in _QUANTILES])
-            cal = conformal_calibration(
-                train_df, feature_cols, target_name, _fit_predict, embargo=h,
+    # statsmodels draws the random restarts of ``search_reps`` from NumPy's
+    # GLOBAL random state, so the fit depended on whatever ran before it: on
+    # one Reliance series it failed outright under 1 of 30 states and settled
+    # on AR(2) or AR(1) depending on the state (README section 68). Fixed seeds
+    # make it reproducible, the caller's state is restored, and a specification
+    # is retried with other seeds and then without random restarts before the
+    # model is simplified.
+    saved = np.random.get_state()
+    try:
+        for ar_order in [order, 1, 0]:
+            mod = MarkovAutoregression(
+                ret_values,
+                k_regimes=k_regimes,
+                order=ar_order,
+                switching_variance=True,
             )
+            for seed, reps in [(s, 20) for s in _SEARCH_SEEDS] + [(None, 0)]:
+                try:
+                    if seed is not None:
+                        np.random.seed(seed)
+                    result = mod.fit(maxiter=200, disp=False, search_reps=reps)
+                    print(
+                        f"Markov Switching AR({ar_order}) with {k_regimes} regimes "
+                        f"converged (LL={result.llf:.2f})"
+                    )
+                    return result
+                except Exception as e:
+                    last = e
+            print(f"  AR({ar_order}) failed: {last}, trying simpler...")
+    finally:
+        np.random.set_state(saved)
 
-        for v in variants:
-            lo, mid, hi = adjust_quantiles(q_origin, cal, *v)
-            lower_price, median_price, upper_price = (
-                float(last_price * np.exp(x)) for x in (lo, mid, hi))
-            rows[v].append({
-                'datetime': future_dates[i],
-                'predicted_price': median_price,
-                'lower_bound': lower_price,
-                'upper_bound': upper_price,
-                'volatility': float((upper_price - lower_price) / (2 * 1.96)),
-            })
-
-    return {v: pd.DataFrame(r) for v, r in rows.items()}
+    raise RuntimeError("All Markov Switching specifications failed")
 
 
-# ==========================================
-# 4. Main Orchestrator (Direct Multi-Horizon)
-# ==========================================
-def run_quantile_prediction(df, interval, horizon, leaf_scale=None, shrink=None,
-                            cqr=None):
+def regime_parameters(ms_result):
     """
-    Main function to run quantile forecasting with LightGBM.
+    Each regime's mean and standard deviation of returns, from the fit.
 
-    Uses **direct multi-horizon** forecasting: for each step ``h`` three
-    LightGBM models target the 2.5th / 50th / 97.5th quantiles of the
-    *cumulative* log return ``log(P[t+h]/P[t])``, forecast directly from the
-    observed features at the last bar. This yields native probabilistic
-    intervals whose width grows naturally with horizon, and avoids the
-    recursive error accumulation (and one-bar origin offset) of the previous
-    step-by-step scheme.
+    The model is fitted on a NumPy array, so ``ms_result.params`` is an array,
+    not a Series, and looking it up by name (``params['sigma2[0]']``) always
+    failed. The old code caught that and fell back to a mean of 0 and a
+    standard deviation of 1% for every regime of every stock, so the served
+    range never used the fit (README section 88). Parameters are looked up by
+    position in ``model.param_names``, and a missing one is an error, not a
+    silent default.
+    """
+    names = list(ms_result.model.param_names)
+    values = np.asarray(ms_result.params, dtype=np.float64)
+    k = ms_result.k_regimes
+
+    def get(name):
+        if name not in names:
+            raise RuntimeError(f"Markov switching fit has no parameter {name!r}")
+        return float(values[names.index(name)])
+
+    means = np.array([get(f'const[{i}]') for i in range(k)])
+    var = np.array([get(f'sigma2[{i}]') for i in range(k)])
+    if not np.all(np.isfinite(means)) or not np.all(np.isfinite(var)) or np.any(var <= 0):
+        raise RuntimeError("Markov switching fit gave a non-finite or non-positive variance")
+    return means, np.sqrt(var)
+
+
+# ==========================================
+# 3. Monte Carlo Simulation with Regime Switching
+# ==========================================
+def _simulate_regime_paths(ms_result, last_price, horizon):
+    """
+    Monte Carlo simulation of future price paths under regime dynamics.
+
+    For each simulation path:
+    1. Start from the current smoothed regime probabilities.
+    2. At each step, sample the next regime from the transition matrix.
+    3. Draw a return from the regime-specific distribution
+       (regime mean + regime std * N(0,1)).
+    4. Accumulate log returns to build a price path.
+
+    This naturally produces wider confidence intervals during
+    high-volatility regimes and tighter ones during calm periods.
+
+    Parameters
+    ----------
+    ms_result : MarkovAutoregressionResultsWrapper
+        Fitted Markov Switching model.
+    last_price : float
+        Last observed adjusted close price.
+    horizon : int
+        Number of future steps to simulate.
+
+    Returns
+    -------
+    dict
+        'predicted_price' : np.ndarray (horizon,) — median price.
+        'lower_bound'     : np.ndarray (horizon,) — 2.5th percentile.
+        'upper_bound'     : np.ndarray (horizon,) — 97.5th percentile.
+        'volatility'      : np.ndarray (horizon,) — std of simulated returns.
+    """
+    # A local generator: seeding NumPy's global state here changed what every
+    # model run after this one drew (README section 68).
+    rng = np.random.default_rng(42)
+
+    k_regimes = ms_result.k_regimes
+    regime_means, regime_stds = regime_parameters(ms_result)
+
+    raw_tm = np.asarray(ms_result.regime_transition, dtype=np.float64)
+    if raw_tm.ndim == 1:
+        transition_matrix = raw_tm.reshape(k_regimes, k_regimes)
+    else:
+        transition_matrix = raw_tm
+    if transition_matrix.shape[0] != k_regimes:
+        transition_matrix = transition_matrix.T
+
+    smoothed = ms_result.smoothed_marginal_probabilities
+    if hasattr(smoothed, 'iloc'):
+        current_probs = np.asarray(
+            smoothed.iloc[-1], dtype=np.float64,
+        ).flatten()
+    else:
+        current_probs = np.asarray(smoothed[-1], dtype=np.float64).flatten()
+
+    current_probs = np.maximum(current_probs, 0.0)
+    cp_sum = current_probs.sum()
+    if cp_sum > 0:
+        current_probs = current_probs / cp_sum
+    else:
+        current_probs = np.ones(k_regimes) / k_regimes
+
+    price_paths = np.zeros((horizon, _N_SIMS))
+    all_returns = np.zeros((horizon, _N_SIMS))
+
+    for s in range(_N_SIMS):
+        regime = rng.choice(k_regimes, p=current_probs)
+        cum_return = 0.0
+
+        for t in range(horizon):
+            ret = regime_means[regime] + regime_stds[regime] * rng.standard_normal()
+            all_returns[t, s] = ret
+            cum_return += ret
+            price_paths[t, s] = last_price * np.exp(cum_return)
+
+            trans_probs = np.asarray(
+                transition_matrix[:, regime], dtype=np.float64,
+            ).flatten()
+            trans_probs = np.maximum(trans_probs, 0.0)
+            total = trans_probs.sum()
+            if total > 0:
+                trans_probs = trans_probs / total
+            else:
+                trans_probs = np.ones(k_regimes) / k_regimes
+            regime = rng.choice(k_regimes, p=trans_probs)
+
+    valid = np.all(np.isfinite(price_paths) & (price_paths > 0), axis=0)
+    if valid.sum() >= 100:
+        price_paths = price_paths[:, valid]
+        all_returns = all_returns[:, valid]
+
+    return {
+        'predicted_price': np.median(price_paths, axis=1),
+        'lower_bound': np.percentile(price_paths, 2.5, axis=1),
+        'upper_bound': np.percentile(price_paths, 97.5, axis=1),
+        'volatility': np.std(all_returns, axis=1),
+    }
+
+
+# ==========================================
+# 4. Generate Forecasts
+# ==========================================
+def _generate_forecasts(df, ms_result, horizon, interval):
+    """
+    Generate future price forecasts with regime-aware confidence intervals.
+
+    Combines the fitted Markov Switching model with Monte Carlo
+    simulation, then builds the output DataFrame with business-day
+    or market-hour date generation.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Raw stock DataFrame with datetime, OHLCV columns.
+        Prepared DataFrame with adj_close and datetime index.
+    ms_result : MarkovAutoregressionResultsWrapper
+        Fitted Markov Switching model.
+    horizon : int
+        Forecast steps.
+    interval : str
+        'daily' or 'hourly'.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ['datetime', 'predicted_price', 'lower_bound',
+        'upper_bound', 'volatility'].
+    """
+    last_price = float(df['adj_close'].iloc[-1])
+    last_date = df.index[-1]
+
+    print(f"Simulating {_N_SIMS} regime-switching paths for {horizon} steps...")
+    sim = _simulate_regime_paths(ms_result, last_price, horizon)
+
+    future_dates = generate_future_dates(last_date, horizon, interval)
+
+    future_data = []
+    for i in range(horizon):
+        future_data.append({
+            'datetime': future_dates[i],
+            'predicted_price': sim['predicted_price'][i],
+            'lower_bound': sim['lower_bound'][i],
+            'upper_bound': sim['upper_bound'][i],
+            'volatility': sim['volatility'][i],
+        })
+
+    return pd.DataFrame(future_data)
+
+
+# ==========================================
+# 5. Main Orchestrator
+# ==========================================
+def run_regime_prediction(df, interval, horizon):
+    """
+    Main function to run Markov Regime Switching prediction.
+
+    Fits a Markov Switching Autoregression that identifies hidden
+    market regimes (e.g., bull/low-volatility vs bear/high-volatility)
+    with regime-dependent means and variances. Forecasts are generated
+    via Monte Carlo simulation that respects the regime transition
+    probabilities, naturally widening confidence intervals in
+    uncertain or volatile regimes.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Raw stock DataFrame with 'datetime' and 'adj_close' columns.
     interval : str
         '1d' / 'daily' / '1 Day' or '1h' / 'hourly' / '1 Hour'.
     horizon : int
-        Number of future steps.
-    leaf_scale, shrink, cqr : bool or None, optional
-        README section 111's switches; None takes :func:`resolve_switches`'s
-        default (all off, ``QUANTILE_LEGACY``). ``leaf_scale``: at least
-        min(20 h, a fifth of the rows) per leaf (:func:`min_leaf`). ``shrink``
-        and ``cqr``: see :func:`adjust_quantiles`.
+        Number of future steps to predict.
 
     Returns
     -------
@@ -298,10 +308,15 @@ def run_quantile_prediction(df, interval, horizon, leaf_scale=None, shrink=None,
         'upper_bound', 'volatility'].
     """
     interval = normalize_interval(interval)
-    print(f"--- Starting Quantile Prediction ({interval}) ---")
-    sw = resolve_switches(interval, horizon, leaf_scale, shrink, cqr)
-    v = (sw['shrink'], sw['cqr'])
-    out = quantile_paths(df, interval, horizon, leaf_scale=sw['leaf_scale'], variants=[v])[v]
-    print("Quantile Prediction Complete.")
-    return out
+    print(f"--- Starting Regime Switching Prediction ({interval}) ---")
+
+    max_obs = 750 if interval == 'daily' else 500
+    clean_df = prepare_log_returns(df, max_obs=max_obs)
+
+    ms_result = _fit_markov_switching(clean_df['log_return'])
+
+    results_df = _generate_forecasts(clean_df, ms_result, horizon, interval)
+
+    print("Regime Switching Prediction Complete.")
+    return results_df
 ```
