@@ -9,236 +9,302 @@
   
 ```
 """
-Forecast the fixed watchlist and log it, exactly as the app would serve it.
+The app's serving pipeline without Streamlit: fetch, run each model, assess
+it, gate it.
 
-The forward prediction log (README section 28) grows only as fast as the app
-is used. This runs the app's own pipeline (``serving.py``: fetch, every
-model, the walk-forward confidence gate, the data-quality and novelty gates)
-on a watchlist chosen by a rule before the first forecast (``watchlist.json``),
-and writes each forecast to the log with ``source="watchlist"``. Nothing is
-selected after the fact: every name, every week, every model is in the record.
-README section 78.
-
-Usage::
-
-    python run_watchlist.py              # forecast and log every name
-    python run_watchlist.py --dry-run    # run everything, log nothing (timing, checks)
-    python run_watchlist.py --only "Infosys Limited"
-    python run_watchlist.py --jobs 3     # companies in parallel (default 3)
-
-A company already logged for the same origin (its last bar) is skipped, so a
-re-run or a retried scheduled run cannot write the same forecast twice. A daily
-bar from a session still open is dropped, so a run during market hours forecasts
-from the last close rather than from a half-finished day. Workers only compute;
-the log is written by this process alone, one company at a time.
+``UI.py`` wraps these in ``st.cache_data`` and renders what they return;
+``run_watchlist.py`` calls them on a schedule (README section 78). Both
+paths therefore serve, gate and log a forecast the same way, which is what
+lets the scheduled forecasts stand in for served ones in the forward
+prediction log.
 """
 
-import argparse
-import concurrent.futures as cf
-import contextlib
-import io
-import json
-import os
-import sys
-import time
-import uuid
+import numpy as np
+import pandas as pd
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-WATCHLIST = os.path.join(ROOT, "watchlist.json")
-sys.path.insert(0, ROOT)
+import config as _cfg
+from ARIMA_GARCH import run_statistical_prediction
+from ARIMAX_model import run_arimax_prediction
+from CNN_LSTM_model import run_cnn_lstm_prediction
+from chronos_model import run_chronos_prediction
+from config import USE_ASYMMETRIC_CONE, USE_IV_ADJUST
+from DL_model import run_DL_prediction
+from Ensemble_model import run_ensemble_prediction
+from fb_prophet_model import run_prophet_prediction
+from HAR_RV_model import run_har_rv_prediction
+from Hybrid_model import run_hybrid_prediction
+from kalman_model import run_kalman_prediction
+from meta_ensemble import run_meta_ensemble_prediction
+from ML_model import run_ML_prediction
+from NBeats_model import run_nbeats_prediction
+from Quantile_model import run_quantile_prediction
+from RegimeSwitching_model import run_regime_prediction
+from TCN_model import run_tcn_prediction
+from Transformer_model import run_transformer_prediction
+from vol_lstm_model import run_vol_lstm_prediction
+
+# Single source of truth for the model suite: (display name, function, kwargs),
+# in execution order. The sidebar selector, the runner, and the cache key all
+# derive from this list. NOTE: Meta-Ensemble internally re-runs Quantile-LGBM +
+# XGBoost + ARIMA (ARIMAX's pipeline without regressors), so selecting it alongside those duplicates that compute;
+# per-model caching (in UI.py) makes the duplication a cache hit rather than a
+# recomputation.
+MODEL_REGISTRY = [
+    ("ARIMA-GARCH", run_statistical_prediction, {}),
+    ("ARIMAX-GARCH", run_arimax_prediction, {}),
+    ("Prophet", run_prophet_prediction, {}),
+    ("LSTM (DL)", run_DL_prediction, {'model_type': 'LSTM'}),
+    ("GRU (DL)", run_DL_prediction, {'model_type': 'GRU'}),
+    ("XGBoost (ML)", run_ML_prediction, {'model_type': 'xgboost'}),
+    ("LightGBM (ML)", run_ML_prediction, {'model_type': 'lightgbm'}),
+    ("Transformer", run_transformer_prediction, {}),
+    ("Chronos-2", run_chronos_prediction, {}),  # company_name injected at call
+    ("N-BEATS", run_nbeats_prediction, {}),
+    ("TCN", run_tcn_prediction, {}),
+    ("CNN-LSTM", run_cnn_lstm_prediction, {}),
+    ("Stacking Ensemble", run_ensemble_prediction, {}),
+    ("Quantile (LGB)", run_quantile_prediction, {}),
+    ("Regime Switching", run_regime_prediction, {}),
+    ("Hybrid ARIMA+LSTM", run_hybrid_prediction, {}),
+    # The only state-space model in the suite: parameters are re-estimated every
+    # bar rather than frozen after a fit, and the interval falls out of the state
+    # covariance instead of a conformal calibration (Klaas Ch. 4).
+    ("Kalman (local trend)", run_kalman_prediction, {}),
+    ("HAR-RV (volatility)", run_har_rv_prediction,
+     {'iv_adjust': USE_IV_ADJUST, 'asymmetric': USE_ASYMMETRIC_CONE}),
+    ("Vol-LSTM (volatility)", run_vol_lstm_prediction,
+     {'asymmetric': USE_ASYMMETRIC_CONE}),
+    ("Meta-Ensemble", run_meta_ensemble_prediction, {}),
+]
+MODEL_NAMES = [name for name, _, _ in MODEL_REGISTRY]
+#: A note shown on a model's card whenever it runs (README sections 89 and 92).
+MODEL_NOTES = {
+    "Prophet": ("On daily NSE data before 2025, Prophet's own trend and seasonality forecast "
+                "worse than no change (README section 89). Its predicted change is now shrunk "
+                "toward no change by how well it predicted at 20 recent dates, often to none, "
+                "and its error is then about that of a no-change forecast (README section 116 "
+                "for daily bars, README section 118 for hourly bars). Weigh its range, not "
+                "its line."),
+}
+#: Listed in the app but not selected by default. Empty since section 92: every
+#: model starts selected and the user decides, with MODEL_NOTES on the card.
+OFF_BY_DEFAULT = frozenset()
+DEFAULT_MODELS = [m for m in MODEL_NAMES if m not in OFF_BY_DEFAULT]
+_MODEL_LOOKUP = {name: (func, kwargs) for name, func, kwargs in MODEL_REGISTRY}
+
+# Walk-forward confidence-gate settings (kept light so it stays interactive).
+GATE_SPLITS = _cfg.GATE_SPLITS
+GATE_MIN_TRAIN = _cfg.GATE_MIN_TRAIN
+GATE_MAX_ROWS = _cfg.GATE_MAX_ROWS
 
 
-def load_watchlist(path=WATCHLIST):
-    with open(path, encoding="utf-8") as f:
-        w = json.load(f)
-    for key in ("frozen_on", "companies", "interval", "horizon", "models", "assess"):
-        if key not in w:
-            raise ValueError(f"{path}: missing '{key}'")
-    return w
+def _call_args(company_name, model_name):
+    func, kwargs = _MODEL_LOOKUP[model_name]
+    kwargs = dict(kwargs)
+    if model_name == "Chronos-2":
+        kwargs["company_name"] = company_name
+    return func, kwargs
 
 
-def already_logged(log_df, company, origin):
-    """True when this company's forecast from this origin is in the log."""
-    if log_df.empty:
-        return False
-    m = ((log_df["source"] == "watchlist") & (log_df["ticker"] == company)
-         & (log_df["origin_datetime"] == str(origin)))
-    return bool(m.any())
-
-
-#: NSE closes at 15:30 IST; a daily bar dated today is final after this.
-SESSION_FINAL = "16:00"
-
-
-def drop_open_session(hist, now=None):
-    """History without today's daily bar while today's session may still be open."""
-    import pandas as pd
-    now = pd.Timestamp.now(tz="Asia/Kolkata") if now is None else pd.Timestamp(now)
-    dt = pd.to_datetime(hist["datetime"])
-    if dt.dt.tz is not None:
-        dt = dt.dt.tz_localize(None)
-    today = (now.tz_localize(None) if now.tzinfo else now).normalize()
-    if dt.max().normalize() == today and now.strftime("%H:%M") < SESSION_FINAL:
-        return hist[(dt < today).to_numpy()].reset_index(drop=True)
-    return hist
-
-
-def forecast_company(company, w, models, log=True, quiet=True, skip_logged=None):
+def fetch_history(company_name, backend_interval, use_context, note=None):
     """
-    Serve one company the way the app's Submit does, and log every model.
+    Historical OHLCV for a company, optionally with market-context features.
 
-    Same order as UI.py: run the models, take the anchor from the history,
-    the data-quality gate, the walk-forward confidence gate, the data-quality
-    override, then the novelty gate. Returns a dict summary whose ``entries``
-    are the ``log_forecast`` calls (written here when ``log`` is True).
-    ``skip_logged`` (default: ``log``) skips a company already logged for
-    this origin.
+    Resilient fetch: retries + last-known-good cache fallback, tagging
+    ``attrs['source']`` (live / partial / cached_fallback), which the
+    data-quality gate reads. Returns None when the backend returned nothing.
+    ``note(msg)`` receives a skipped-enrichment message.
     """
-    import pandas as pd
-
-    import prediction_log as pl
-    import serving
-    from config import USE_MARKET_CONTEXT, USE_REGIME_NOVELTY
-    from data_quality import assess_data_quality
-    from gating import apply_data_quality_gate, apply_horizon_gate, apply_novelty_gate
-    from reproducibility import GLOBAL_SEED, set_all_seeds
-
-    interval, horizon = w["interval"], int(w["horizon"])
-    hush = contextlib.redirect_stdout(io.StringIO()) if quiet else contextlib.nullcontext()
-    set_all_seeds(GLOBAL_SEED)
-    with hush:
-        hist = serving.fetch_history(company, interval, USE_MARKET_CONTEXT)
-    if hist is None:
-        return {"company": company, "status": "no data"}
-    if interval == "1d":
-        hist = drop_open_session(hist)
-    origin = pd.to_datetime(hist["datetime"]).max()
-    if (log if skip_logged is None else skip_logged) and already_logged(pl.read_log(), company, origin):
-        return {"company": company, "status": f"already logged for {origin.date()}"}
-
-    results, failed = {}, []
-    for name in models:
+    from get_data import get_whole_stock_data
+    from safe_fetch import fetch_with_fallback
+    hist_df = fetch_with_fallback(
+        company_name, backend_interval, fetch_fn=get_whole_stock_data)
+    if not isinstance(hist_df, pd.DataFrame) or hist_df.empty:
+        return None
+    if use_context:
         try:
-            with hush:
-                pred = serving.run_model(hist, company, interval, horizon, name)
-            if serving.is_usable(pred):
-                results[name] = pred
-            else:
-                failed.append((name, "non-finite price"))
-        except Exception as exc:
-            failed.append((name, str(exc)[:80]))
-    if not results:
-        return {"company": company, "status": "no model produced a forecast", "failed": failed}
-
-    anchor = serving.last_price(hist)
-    dq = assess_data_quality(hist, interval, horizon)
-    conf = {}
-    if w["assess"]:
-        for name in results:
-            try:
-                with hush:
-                    conf[name] = serving.model_confidence(hist, company, interval, horizon, name)
-            except Exception as exc:
-                conf[name] = {"bucket": "N/A", "note": str(exc)[:80]}
-    conf = apply_data_quality_gate(conf, list(results), dq.mode in ("risk_cone_only", "abstain"))
-    novelty = {"available": False, "verdict": "unknown"}
-    if USE_REGIME_NOVELTY:
-        with hush:
-            novelty = serving.regime_novelty(hist, interval)
-        conf = apply_novelty_gate(conf, list(results), novelty)
-    conf = apply_horizon_gate(conf, list(results), horizon, interval)
-
-    run_id = "wl-" + uuid.uuid4().hex[:9]
-    entries = [dict(ticker=company, interval=interval, horizon=horizon, model=name,
-                    prediction_df=pred, anchor_price=float(anchor), origin_datetime=origin,
-                    confidence_bucket=conf.get(name, {}).get("bucket"),
-                    dq_mode=dq.mode, novelty_verdict=novelty.get("verdict"),
-                    seed=GLOBAL_SEED, run_id=run_id, source="watchlist")
-               for name, pred in results.items()]
-    r = {"company": company, "status": "ok", "origin": str(origin.date()),
-         "models": len(results), "logged": 0, "failed": failed,
-         "dq_mode": dq.mode, "novelty": novelty.get("verdict"), "entries": entries}
-    if log:
-        write_entries(r)
-    return r
+            from market_context import add_market_context
+            hist_df = add_market_context(hist_df, backend_interval)
+        except Exception as ctx_err:
+            if note:
+                note(f"market-context enrichment skipped: {ctx_err}")
+    return hist_df
 
 
-def write_entries(r):
-    """Write a result's forecasts to the log; sets and returns ``r['logged']``."""
-    import prediction_log as pl
-    r["logged"] = sum(1 for e in r.get("entries", []) if pl.log_forecast(**e))
-    return r["logged"]
+def run_model(hist_df, company_name, backend_interval, horizon, model_name):
+    """One model's prediction, its 95% band widened to be monotone (README section 70)."""
+    func, kwargs = _call_args(company_name, model_name)
+    out = func(hist_df, backend_interval, horizon, **kwargs)
+    from model_utils import widen_to_monotone
+    return widen_to_monotone(out)
 
 
-def _work(args):
-    """A worker process: compute one company, log nothing (the parent writes)."""
-    company, w, models, quiet = args
-    os.environ.setdefault("STOCKAPP_QUIET", "1")
+def get_col_by_candidates(df, candidates):
+    """
+    Find the first existing column from a list of candidates (case-insensitive).
+
+    Returns the actual column name from the DataFrame if found, else None.
+    """
+    df_cols = [c.lower() if isinstance(c, str) else str(c).lower()
+               for c in df.columns]
+    for cand in candidates:
+        if cand.lower() in df_cols:
+            return df.columns[df_cols.index(cand.lower())]
+    return None
+
+
+PRICE_COLS = ['predicted_price', 'prediction', 'forecast', 'yhat', 'pred']
+HIST_PRICE_COLS = ['adj_close', 'adj close', 'close', 'price']
+
+
+def final_price(pred_df):
+    """The last predicted price, or NaN when the frame has none."""
+    col = get_col_by_candidates(pred_df, PRICE_COLS)
+    if col is None or not len(pred_df):
+        return float('nan')
+    return float(pd.to_numeric(pred_df[col], errors='coerce').iloc[-1])
+
+
+def is_usable(pred_df):
+    """
+    A forecast the app may serve. A NaN/inf final price is a failed fit, not a
+    forecast: kept, it read as "Bearish" (NaN >= 0 is False) and turned the risk
+    panel's median NaN.
+    """
+    return (isinstance(pred_df, pd.DataFrame) and len(pred_df) > 0
+            and bool(np.isfinite(final_price(pred_df))))
+
+
+def model_confidence(hist_df, company_name, backend_interval, horizon, model_name):
+    """
+    A model's recent skill from a light walk-forward backtest, and its bucket.
+
+    The serve-time "predictability gate": per request, whether the model
+    actually beats a random walk here.
+
+    Returns
+    -------
+    dict
+        {'bucket', 'improvement', 'dm_p', 'coverage', 'model_rmse',
+         'baseline_rmse', 'n_eval', 'note'}.
+    """
+    import backtest as bt
+    from backtest import confidence_bucket
+
+    base = {'bucket': 'N/A', 'improvement': float('nan'), 'dm_p': float('nan'),
+            'coverage': float('nan'), 'model_rmse': float('nan'),
+            'baseline_rmse': float('nan'), 'n_eval': 0, 'note': ''}
+    if hist_df is None or len(hist_df) < GATE_MIN_TRAIN + horizon + 10:
+        base['bucket'] = 'No data'
+        base['note'] = 'insufficient history for a walk-forward check'
+        return base
+
+    gate_df = hist_df.tail(GATE_MAX_ROWS).reset_index(drop=True)
+    func, kwargs = _call_args(company_name, model_name)
+
     try:
-        return forecast_company(company, w, models, log=False, quiet=quiet, skip_logged=True)
+        res = bt.walk_forward_backtest(
+            gate_df, func, backend_interval, horizon,
+            n_splits=GATE_SPLITS, min_train=GATE_MIN_TRAIN,
+            predict_kwargs=kwargs, model_name=model_name, verbose=False,
+            # The serve-time gate needs the RMSE/DM summary only. The economic
+            # block is deliberately NOT surfaced here: with 3 origins its Sharpe
+            # would be pure noise, and showing a noisy Sharpe next to a
+            # calibrated confidence bucket would undercut the honesty the gate
+            # exists to provide. Use tests/validation/run_strategy_eval.py, which
+            # runs enough non-overlapping origins for the number to mean something.
+            strategy=False,
+        )
     except Exception as exc:
-        return {"company": company, "status": f"failed: {str(exc)[:120]}"}
+        base['note'] = f'assessment failed: {str(exc)[:80]}'
+        return base
+
+    s = res['summary']
+    dm = res.get('dm', {})
+    model_rmse = float(s.loc['rmse', 'model'])
+    baseline_rmse = min(
+        float(s.loc['rmse', c]) for c in ('naive', 'drift', 'ar1')
+        if c in s.columns
+    )
+    improvement = ((baseline_rmse - model_rmse) / baseline_rmse
+                   if baseline_rmse > 0 else 0.0)
+    dm_p = float(dm.get('p_value', float('nan')))
+    coverage = (float(s.loc['coverage', 'model'])
+                if 'coverage' in s.index else float('nan'))
+
+    return {
+        'bucket': confidence_bucket(improvement, dm_p, coverage),
+        'improvement': improvement,
+        'dm_p': dm_p,
+        'coverage': coverage,
+        'model_rmse': model_rmse,
+        'baseline_rmse': baseline_rmse,
+        'n_eval': len(res.get('origins', [])),
+        'note': '',
+    }
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--dry-run", action="store_true", help="run everything, log nothing")
-    p.add_argument("--only", help="one company from the watchlist")
-    p.add_argument("--verbose", action="store_true", help="show every model's own output")
-    p.add_argument("--jobs", type=int, default=3, help="companies in parallel (default 3)")
-    p.add_argument("--watchlist", default=WATCHLIST, help="watchlist file (default watchlist.json)")
-    a = p.parse_args(argv)
+def regime_novelty(hist_df, backend_interval):
+    """
+    How unlike its fitted history the latest market window is.
 
-    os.environ.setdefault("STOCKAPP_QUIET", "1")
-    w = load_watchlist(a.watchlist)
-    companies = w["companies"]
-    if a.only:
-        if a.only not in companies:
-            print(f"'{a.only}' is not on the watchlist")
-            return 2
-        companies = [a.only]
-    import serving
-    models = serving.MODEL_NAMES if w["models"] == "all" else list(w["models"])
-    unknown = [m for m in models if m not in serving.MODEL_NAMES]
-    if unknown:
-        print(f"watchlist names unknown models: {unknown}")
-        return 2
-
-    print(f"Watchlist frozen {w['frozen_on']}: {len(companies)} companies, {len(models)} models, "
-          f"{w['horizon']}-step {w['interval']}" + ("  [dry run: nothing is logged]" if a.dry_run else ""))
-    t_all = time.time()
-    done = {}
-
-    def report(r):
-        if r["status"] == "ok" and not a.dry_run:
-            write_entries(r)
-        done[r["company"]] = r
-        line = f"  {r['company']:<34} {r['status']}"
-        if r["status"] == "ok":
-            line += (f" | origin {r['origin']} | {r['models']} models, {r['logged']} logged"
-                     f" | data {r['dq_mode']}, regime {r['novelty']}")
-        print(line + f" | {(time.time() - t_all) / 60:.0f} min elapsed", flush=True)
-        for name, why in r.get("failed", []):
-            print(f"      {name} failed: {why}")
-
-    tasks = [(c, w, models, not a.verbose) for c in companies]
+    Wraps ``autoencoder_regime.regime_novelty``. This is the signal the other two
+    gates cannot see: ``data_quality`` catches a broken *input*, and the
+    confidence bucket catches a model with no measured edge *in the past* — but
+    neither knows that the present regime is off-manifold, where a
+    backtest-derived bucket is an extrapolation rather than evidence. Every
+    failure path returns ``available=False``, which is a no-op for the gate,
+    so enabling this can only ever add information.
+    """
+    if hist_df is None:
+        return {'available': False, 'verdict': 'unknown', 'note': 'no history'}
     try:
-        with cf.ProcessPoolExecutor(max_workers=max(1, min(a.jobs, len(tasks)))) as ex:
-            for fut in cf.as_completed([ex.submit(_work, task) for task in tasks]):
-                report(fut.result())
-    except cf.process.BrokenProcessPool:
-        # A worker died (out of memory, a native crash). What finished is
-        # already logged; the rest run here, one at a time, so a scheduled
-        # week is not lost.
-        left = [task for task in tasks if task[0] not in done]
-        print(f"  a worker process died; running the {len(left)} remaining one at a time", flush=True)
-        for task in left:
-            report(_work(task))
-    ok = sum(r["status"] == "ok" for r in done.values())
-    print(f"Done: {ok} of {len(companies)} served in {(time.time() - t_all) / 60:.0f} min.")
-    return 0 if ok else 1
+        import autoencoder_regime as ar
+        return ar.regime_novelty(hist_df, backend_interval)
+    except Exception as exc:
+        return {'available': False, 'verdict': 'unknown',
+                'note': f'novelty check unavailable: {str(exc)[:100]}'}
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+def last_price(hist_df):
+    """The last observed price, the forecast's anchor, or None."""
+    col = get_col_by_candidates(hist_df, HIST_PRICE_COLS)
+    return float(hist_df[col].iloc[-1]) if col else None
+
+
+#: A served band more than BAND_SANITY times wider, or narrower, than the
+#: random-walk band the stock's own recent volatility implies is flagged
+#: (README section 85). Vol-LSTM's exploding bands (section 83) went unseen
+#: because every check looked at coverage, and a band wide enough covers all.
+BAND_SANITY = 4.0
+BAND_SANITY_WINDOW = 60
+
+
+def band_sanity(pred_df, hist_df, ratio=BAND_SANITY, window=BAND_SANITY_WINDOW):
+    """
+    ``(q, flagged)``: the last step's band width over the random-walk band.
+
+    The reference is the 95% band of a random walk with the volatility of the
+    last ``window`` returns, ``exp(+-1.96 * sd * sqrt(h))`` around the last price,
+    in the history's own bar units (so hourly is compared with hourly). ``q`` is
+    NaN, and nothing is flagged, when the band or the history is missing.
+    """
+    nan = (float("nan"), False)
+    if not isinstance(pred_df, pd.DataFrame) or not {"lower_bound", "upper_bound"} <= set(pred_df.columns):
+        return nan
+    col = get_col_by_candidates(hist_df, HIST_PRICE_COLS) if isinstance(hist_df, pd.DataFrame) else None
+    if not col or len(pred_df) == 0:
+        return nan
+    p = pd.to_numeric(hist_df[col], errors="coerce").to_numpy(dtype=float)
+    p = p[np.isfinite(p) & (p > 0)]
+    if len(p) < 3:
+        return nan
+    sd = float(np.std(np.diff(np.log(p))[-window:], ddof=1))
+    lo, hi = float(pred_df["lower_bound"].iloc[-1]), float(pred_df["upper_bound"].iloc[-1])
+    if not (np.isfinite(lo) and np.isfinite(hi)) or sd <= 0:
+        return nan
+    half = 1.959963984540054 * sd * np.sqrt(len(pred_df))
+    honest = np.exp(half) - np.exp(-half)
+    q = ((hi - lo) / p[-1]) / honest
+    return float(q), bool(q > ratio or q < 1.0 / ratio)
 ```
