@@ -8,465 +8,497 @@
 - Code
   
 ```
-import pandas as pd
+"""
+Kalman filter (damped local linear trend) — the one model class this project lacked.
+
+Why this model is different from the other nineteen
+---------------------------------------------------
+Every other model here fits **fixed parameters** over a training window and then
+freezes them to forecast. A Kalman filter carries a *state* that is re-estimated
+at every bar, so the level and slope it extrapolates from are the ones implied
+by the most recent data, continuously reweighted against their own uncertainty.
+That is a genuinely different answer to non-stationarity than refitting on a
+rolling window.
+
+Klaas, *Machine Learning for Finance*, Ch. 4:
+
+    "Most classic probabilistic modeling techniques, such as Kalman filters, can
+     give confidence intervals for predictions, whereas regular deep learning
+     cannot do this."
+
+That second property is the interesting one here, because this project's
+deliverable is calibrated uncertainty rather than a point forecast. Every
+existing interval is **conformal** — distribution-free, calibrated on held-out
+residuals, and agnostic about the model. A Kalman interval is the opposite: it
+falls straight out of the state covariance, and it is only as good as the model
+assumptions behind it. Whether that native interval is as trustworthy as the
+conformal one is a measurable question, and ``run_kalman_eval.py`` measures it
+rather than assuming either way.
+
+The model
+---------
+Damped local linear trend, on **log prices**::
+
+    level_t  = level_{t-1} + phi * slope_{t-1} + w_level
+    slope_t  = phi * slope_{t-1}               + w_slope
+    y_t      = level_t                         + v
+
+``phi`` in [0, 1] damps the trend, so the h-step forecast adds
+``slope * (phi + phi^2 + ... + phi^h)`` — a geometric sum that converges instead
+of extrapolating a straight line to infinity. Damped trend is the choice that
+wins forecasting competitions, and it matters more than usual here: an
+undamped slope fitted to a recent run-up would extrapolate it indefinitely,
+which is exactly the failure mode this project's whole evaluation layer exists
+to catch.
+
+**The model is allowed to conclude it is a random walk.** If the data prefers
+``q_slope -> 0`` or ``phi -> 0``, the fit degenerates to a local level model,
+whose forecast is flat — indistinguishable from the naive baseline. That is not
+a failure of the implementation; it is the honest answer for a near-efficient
+price series, and the fitted parameters are reported so it is visible when it
+happens.
+
+Estimation
+----------
+Parameters are fitted by maximum likelihood on the training window, via a coarse
+grid over ``(q_level/r, q_slope/r, phi)`` followed by a local refinement. Grid
+search rather than an optimiser because the likelihood surface for state-space
+models is famously multi-modal and flat in places, and a 3-parameter grid is
+cheap. ``r`` is fixed at 1 and the noise **scale** is profiled out analytically (the
+concentrated likelihood), because only the *ratios* drive the filter's
+behaviour. Scoring the raw likelihood at a fixed ``r`` instead is a trap that
+this implementation fell into first: on log-price data of scale ~0.02 it rewards
+whichever ratio pushes the innovation variance towards 1, so it drives
+``q -> 0`` no matter what the truth is. No SciPy, consistent with the rest of this
+project.
+"""
+
 import numpy as np
-import pmdarima as pm
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from sklearn.preprocessing import MinMaxScaler
-import os
-import warnings
+import pandas as pd
 
-from model_utils import (
-    normalize_interval,
-    prepare_log_returns,
-    reset_keras_seeds,
-    temporal_train_val_split,
-    default_keras_callbacks,
-    generate_future_dates,
-)
-
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-
-_LOOK_BACK = 30
+_EPS = 1e-12
+_Z95 = 1.959963984540054
 
 
 # ==========================================
-# 1. ARIMA Component (Linear)
+# 1. The filter
 # ==========================================
-def _fit_arima(returns):
+def kalman_filter(y, q_level, q_slope, r, phi=1.0, return_states=False):
     """
-    Fit Auto-ARIMA on log returns to capture the linear component.
-
-    Uses BIC for model selection, d=0 (returns are stationary), and
-    caps the total ARMA order at 10 to prevent overfitting.
-
-    Parameters
-    ----------
-    returns : pd.Series or np.ndarray
-        Log return series.
+    Run the damped local-linear-trend filter over ``y`` (log prices).
 
     Returns
     -------
-    pmdarima.ARIMA
-        Fitted ARIMA model.
+    dict
+        ``loglik`` (diffuse: the first two observations initialise the state and
+        are excluded from the likelihood, so different parameterisations are
+        compared on the same terms), ``level``, ``slope``, ``P`` (final 2x2 state
+        covariance), ``innovations``, and the filtered paths when requested.
+
+    Implementation note: the 2x2 algebra is written out rather than using
+    ``numpy.linalg``. At this size the explicit form is faster, and — more
+    usefully — it makes the update visibly a scalar Kalman gain, which is what
+    the reader needs to check.
     """
-    print("Fitting ARIMA (linear component)...")
-    arima_model = pm.auto_arima(
-        returns,
-        start_p=0, start_q=0,
-        max_p=5, max_q=5,
-        max_order=10,
-        d=0,
-        seasonal=False,
-        information_criterion='bic',
-        stepwise=True,
-        suppress_warnings=True,
-        error_action='ignore',
-        trace=False,
-    )
-    print(f"Best ARIMA Order: {arima_model.order}")
-    return arima_model
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    if n < 3:
+        return {"loglik": -np.inf, "level": np.nan, "slope": 0.0,
+                "P": np.eye(2) * 1e6, "innovations": np.array([]),
+                "levels": np.array([]), "slopes": np.array([])}
 
+    # Diffuse-ish initialisation from the first two points: level at y[0], slope
+    # from the first difference, with a wide prior so the data dominates fast.
+    level, slope = float(y[0]), float(y[1] - y[0])
+    p11, p12, p22 = 1e4, 0.0, 1e4
 
-# ==========================================
-# 3. LSTM Component (Non-linear Residuals)
-# ==========================================
-def _build_residual_sequences(residuals, look_back=_LOOK_BACK):
-    """
-    Create scaled look-back sequences from ARIMA residuals for the LSTM.
+    sum_log_s = 0.0
+    sum_e2_s = 0.0
+    n_eff = 0
+    innov = np.empty(n)
+    innov[:] = np.nan
+    levels = np.empty(n)
+    slopes = np.empty(n)
 
-    The LSTM learns the non-linear patterns that ARIMA cannot capture.
-    Residuals are scaled to [0, 1] before sequencing.
+    for t in range(n):
+        # --- predict -------------------------------------------------------
+        level_p = level + phi * slope
+        slope_p = phi * slope
+        # F P F' + Q, with F = [[1, phi], [0, phi]]
+        p11_p = p11 + 2.0 * phi * p12 + phi * phi * p22 + q_level
+        p12_p = phi * p12 + phi * phi * p22
+        p22_p = phi * phi * p22 + q_slope
 
-    Parameters
-    ----------
-    residuals : np.ndarray
-        1-D array of ARIMA residuals (observed - ARIMA fitted).
-    look_back : int, optional
-        Number of past residual values per input sequence. Default 30.
+        # --- update --------------------------------------------------------
+        s = p11_p + r                      # innovation variance (scalar)
+        if not np.isfinite(s) or s <= _EPS:
+            return {"loglik": -np.inf, "level": np.nan, "slope": 0.0,
+                    "P": np.eye(2) * 1e6, "innovations": innov,
+                    "levels": levels, "slopes": slopes}
+        e = float(y[t]) - level_p
+        k1 = p11_p / s
+        k2 = p12_p / s
 
-    Returns
-    -------
-    X : np.ndarray
-        (n_samples, look_back, 1) input sequences.
-    y : np.ndarray
-        (n_samples,) target values (next residual, scaled).
-    scaler : MinMaxScaler
-        Fitted scaler for inverse transforms.
-    """
-    resid = residuals.reshape(-1, 1).astype(np.float64)
+        level = level_p + k1 * e
+        slope = slope_p + k2 * e
+        p11 = p11_p * (1.0 - k1)
+        p12 = p12_p * (1.0 - k1)
+        p22 = p22_p - k2 * p12_p
 
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled = scaler.fit_transform(resid).flatten()
+        innov[t] = e
+        levels[t] = level
+        slopes[t] = slope
+        # Skip the first two: they are initialising, not being predicted.
+        if t >= 2:
+            sum_log_s += np.log(s)
+            sum_e2_s += e * e / s
+            n_eff += 1
 
-    X, y = [], []
-    for i in range(look_back, len(scaled)):
-        X.append(scaled[i - look_back:i])
-        y.append(scaled[i])
+    # CONCENTRATED (profile) log-likelihood. The filter runs with r = 1, so every
+    # variance is known only up to a common factor sigma^2. Scoring the raw
+    # Gaussian likelihood at that arbitrary scale does not compare parameter
+    # RATIOS - it just rewards whichever ratio makes the innovation variance
+    # closest to 1, which on log-price data (scale ~0.02) means driving q to
+    # zero regardless of the truth. Profiling sigma^2 out analytically removes
+    # the scale direction entirely and leaves a likelihood in the ratios alone.
+    if n_eff < 3 or sum_e2_s <= _EPS:
+        loglik = -np.inf
+    else:
+        sigma2 = sum_e2_s / n_eff
+        loglik = -0.5 * (sum_log_s + n_eff * np.log(sigma2))
 
-    X = np.array(X).reshape(-1, look_back, 1)
-    y = np.array(y)
-
-    return X, y, scaler
-
-
-def _train_residual_lstm(X, y, output_dim=1):
-    """
-    Train a small LSTM to model the ARIMA residual series.
-
-    Architecture: two LSTM layers (32, 16 units) with dropout,
-    trained with Huber loss, Adam with gradient clipping, early
-    stopping, and LR scheduling on a temporal validation split.
-
-    Parameters
-    ----------
-    X : np.ndarray
-        (n_samples, look_back, 1) input sequences.
-    y : np.ndarray
-        (n_samples,) target values, or (n_samples, output_dim) for the direct
-        strategy.
-    output_dim : int, optional
-        Outputs of the last layer: 1 (shipped, one step) or the horizon.
-
-    Returns
-    -------
-    tf.keras.Model
-        Trained LSTM model for residual prediction.
-    """
-    reset_keras_seeds()
-
-    X_train, X_val, y_train, y_val = temporal_train_val_split(X, y)
-
-    model = Sequential([
-        LSTM(32, return_sequences=True, recurrent_dropout=0.1,
-             input_shape=(X.shape[1], 1)),
-        Dropout(0.2),
-        LSTM(16, return_sequences=False, recurrent_dropout=0.1),
-        Dropout(0.2),
-        Dense(8, activation='relu'),
-        Dense(output_dim),
-    ])
-
-    model.compile(
-        loss='huber',
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3, clipnorm=1.0),
-    )
-
-    print("Training LSTM on ARIMA residuals...")
-    model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=80,
-        batch_size=32,
-        callbacks=default_keras_callbacks(),
-        shuffle=True,
-        verbose=0,
-    )
-    return model
-
-
-# ==========================================
-# 4. Recursive Hybrid Prediction
-# ==========================================
-def _hybrid_paths(arima_preds, residual_histories, last_prices, lstm_model,
-                  resid_scaler):
-    """
-    Recursive hybrid price paths from several origins at once.
-
-    At each step h:
-    1. ARIMA gives the next log return (linear component). Fed its own
-       predictions with fixed parameters, that is exactly the ARIMA's
-       multi-step forecast, so ``arima_preds`` holds it for every step.
-    2. The LSTM predicts the next residual correction (non-linear) from the
-       last ``_LOOK_BACK`` residuals; its own correction extends the buffer.
-    3. The combined return = ARIMA mean + LSTM residual correction, and the
-       price is compounded.
-
-    Every origin moves one step per LSTM call, so calibration costs one
-    batched call per step instead of one per origin and step. The same
-    function makes the calibration paths and the live forecast (one origin),
-    so the band measures the procedure that produces the forecast. (It used
-    to call pmdarima's ``update`` with each prediction, which re-estimates the
-    parameters on the model's own output: 75x slower, and a drift of about 1%
-    of a day's move on an AR(2). README section 69.)
-
-    Parameters
-    ----------
-    arima_preds : array (n_origins, horizon)
-        Each origin's ARIMA multi-step forecast of log returns.
-    residual_histories : list of arrays
-        Each origin's residuals up to the origin (at least ``_LOOK_BACK``).
-    last_prices : array (n_origins,)
-        The price at each origin.
-
-    Returns
-    -------
-    np.ndarray (n_origins, horizon)
-        Predicted prices.
-    """
-    arima_preds = np.atleast_2d(np.asarray(arima_preds, dtype=float))
-    n_orig, horizon = arima_preds.shape
-    buf = np.stack([np.asarray(r, dtype=float)[-_LOOK_BACK:] for r in residual_histories])
-    price = np.asarray(last_prices, dtype=float).copy()
-    out = np.empty((n_orig, horizon))
-    for h in range(horizon):
-        scaled = resid_scaler.transform(buf.reshape(-1, 1)).reshape(n_orig, _LOOK_BACK, 1)
-        lstm_scaled = lstm_model.predict(scaled.astype(np.float32), verbose=0,
-                                         batch_size=max(32, n_orig)).reshape(-1)
-        correction = resid_scaler.inverse_transform(lstm_scaled.reshape(-1, 1)).reshape(-1)
-        price = price * np.exp(arima_preds[:, h] + correction)
-        out[:, h] = price
-        buf = np.concatenate([buf[:, 1:], correction[:, None]], axis=1)
+    out = {"loglik": float(loglik), "level": float(level), "slope": float(slope),
+           "P": np.array([[p11, p12], [p12, p22]]), "innovations": innov,
+           "sigma2": float(sum_e2_s / n_eff) if n_eff else float("nan")}
+    if return_states:
+        out.update({"levels": levels, "slopes": slopes})
     return out
 
 
-def _build_direct_sequences(residuals, horizon, look_back=_LOOK_BACK):
-    """
-    Look-back windows of residuals and, as targets, the cumulative residual
-    over each of the next ``horizon`` steps, for the direct (multiple-output)
-    strategy (Ben Taieb, Bontempi, Atiya and Sorjamaa, Expert Systems with
-    Applications 2012). Inputs are scaled to [0, 1] as for the recursive LSTM;
-    targets are divided by the residuals' standard deviation, returned as
-    ``scale``.
-    """
-    resid = np.asarray(residuals, dtype=np.float64)
-    scaler = MinMaxScaler(feature_range=(0, 1)).fit(resid.reshape(-1, 1))
-    scaled = scaler.transform(resid.reshape(-1, 1)).ravel()
-    scale = float(np.std(resid)) or 1.0
-    X, Y = [], []
-    for i in range(look_back, len(resid) - horizon + 1):
-        X.append(scaled[i - look_back:i])
-        Y.append(np.cumsum(resid[i:i + horizon]) / scale)
-    return np.array(X).reshape(-1, look_back, 1), np.array(Y), scaler, scale
-
-
-def _direct_paths(arima_preds, residual_histories, last_prices, lstm_model,
-                  resid_scaler, scale):
-    """
-    Direct hybrid price paths: the ARIMA's cumulative multi-step forecast plus
-    the network's cumulative residual correction for every step at once, from
-    one call. Nothing the network predicts is fed back to it.
-    """
-    arima_preds = np.atleast_2d(np.asarray(arima_preds, dtype=float))
-    n_orig = arima_preds.shape[0]
-    buf = np.stack([np.asarray(r, dtype=float)[-_LOOK_BACK:] for r in residual_histories])
-    x = resid_scaler.transform(buf.reshape(-1, 1)).reshape(n_orig, _LOOK_BACK, 1)
-    corr = np.asarray(lstm_model.predict(x.astype(np.float32), verbose=0,
-                                         batch_size=max(32, n_orig))) * scale
-    cum = np.cumsum(arima_preds, axis=1) + corr.reshape(n_orig, -1)
-    return np.asarray(last_prices, dtype=float)[:, None] * np.exp(cum)
-
-
-def _vol_at(returns, t, window=60):
-    """Standard deviation of the ``window`` returns before position ``t``."""
-    r = np.asarray(returns, dtype=float)[max(0, t - window):t]
-    return float(np.std(r, ddof=1)) if len(r) > 2 else float("nan")
-
-
-def _conditioned(arima_res, new_returns):
-    """The ARIMA fitted on the training block, run on later returns with its parameters fixed."""
-    if not len(new_returns):
-        return arima_res
-    return arima_res.append(np.asarray(new_returns, dtype=float), refit=False)
-
-
-def _residual_history(arima_res, returns_seen):
-    """Residuals (observed - one-step fitted) over every return the ARIMA has seen."""
-    fitted = np.asarray(arima_res.fittedvalues, dtype=float)
-    return np.asarray(returns_seen, dtype=float)[-len(fitted):] - fitted
-
-
 # ==========================================
-# 5. Main Orchestrator
+# 2. Fitting
 # ==========================================
-def run_hybrid_prediction(df, interval, horizon, alpha=0.05, cal_frac=0.2,
-                          max_cal_origins=80,
-                          strategy="recursive", band="absolute",
-                          lstm=True, min_cal_origins=None):
+# Ratios relative to r = 1. The grid spans "almost no state noise" (the series is
+# essentially a constant plus noise) to "state noise dominates" (a pure random
+# walk), so the fit can land anywhere on that spectrum rather than being nudged.
+_Q_LEVEL_GRID = np.array([1e-4, 1e-3, 1e-2, 0.1, 0.5, 1.0, 5.0, 20.0])
+_Q_SLOPE_GRID = np.array([0.0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2])
+_PHI_GRID = np.array([0.0, 0.5, 0.8, 0.9, 0.95, 0.98])
+
+
+def fit_kalman(log_prices, refine=True):
     """
-    Main function to run the ARIMA + LSTM hybrid prediction, with
-    split-conformal 95% bands.
+    Maximum-likelihood fit of ``(q_level, q_slope, phi)`` with ``r`` profiled out.
 
-    Decomposes the forecasting problem into a linear component
-    (ARIMA on log returns) and a non-linear component (LSTM on
-    ARIMA residuals). This hybrid approach is well-documented in
-    the literature as outperforming either model alone, because
-    ARIMA captures the autocorrelation structure while the LSTM
-    learns complex non-linear residual patterns that ARIMA misses.
-
-    The band is horizon-wise split conformal, as in
-    ``model_utils.forecast_nn_conformal`` for the other recursive models
-    (README section 69):
-
-    1. ARIMA and the residual LSTM are fitted on the earlier ``1 - cal_frac``
-       of the returns only.
-    2. From up to ``max_cal_origins`` origins in the recent block, the ARIMA is
-       updated with the actual returns up to the origin and the hybrid's own
-       recursive path is run; the absolute log error at each step is recorded.
-    3. The finite-sample ``1 - alpha`` quantile of those errors is the
-       half-width at that step, so the band widens with the horizon and
-       carries the model's real multi-step error.
-    4. The forecast comes from the same models updated with every return, and
-       each step is wrapped in ``price * exp(+-half_width)``.
-
-    As in textbook split conformal (and the other recursive models), the
-    networks are trained on about 80% of the window; this costs one fit.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Raw stock DataFrame with 'datetime' and 'adj_close' columns.
-    interval : str
-        '1d' / 'daily' / '1 Day' or '1h' / 'hourly' / '1 Hour'.
-    horizon : int
-        Number of future steps to predict.
-    alpha : float, optional
-        Miscoverage; 0.05 gives 95% bands.
-    cal_frac : float, optional
-        Share of the most recent returns held out to calibrate the band.
-    max_cal_origins : int, optional
-        Cap on calibration origins (subsampled with a stride) to bound cost.
-    strategy : str, optional
-        ``'recursive'`` (shipped): one-step residual LSTM fed its own
-        corrections. ``'direct'``: one network with ``horizon`` outputs
-        predicting the cumulative residual correction at every step.
-    band : str, optional
-        ``'rw'``: no calibration quantile; the reference's band,
-        ``exp(+-1.96 sd60 sqrt(step))`` around the hybrid's own centre
-        (README section 96).
-        ``'absolute'`` (shipped): the conformal quantile of absolute log
-        errors. ``'vol_scaled'``: each error divided by the 60-session return
-        volatility at its origin times sqrt(step), the quantile multiplied back
-        by today's (normalized conformal scores, Papadopoulos, Gammerman and
-        Vovk 2008; Lei et al., JASA 2018).
-    lstm : bool, optional
-        False: the ARIMA alone, a diagnostic for what the LSTM adds; never
-        served.
-    min_cal_origins : int, optional
-        Lengthen the calibration block so it holds at least this many origins
-        (at 90 sessions the shipped 20% of the window holds about 60, whose
-        paths overlap almost entirely). The proper-training block shrinks by
-        the same amount. None: as shipped. README section 96.
+    Only the noise *ratios* drive the filter's behaviour, so the search fixes
+    ``r = 1`` and rescales afterwards using the mean standardised innovation —
+    which turns a 4-parameter search into a 3-parameter one and removes the
+    scale direction the likelihood is flattest along.
 
     Returns
     -------
-    pd.DataFrame
-        Columns: ['datetime', 'predicted_price', 'lower_bound', 'upper_bound',
-        'volatility']. With too little data to calibrate, only
-        ['datetime', 'predicted_price'].
+    dict
+        Fitted parameters, the log-likelihood, and the final state. Includes
+        ``degenerate_to_random_walk``, which is True when the fitted slope
+        variance or damping is effectively zero — the honest outcome for a
+        near-efficient price series, and worth surfacing rather than hiding.
     """
-    interval = normalize_interval(interval)
-    print(f"--- Starting Hybrid ARIMA+LSTM Prediction ({interval}) ---")
-    if strategy not in ("recursive", "direct"):
-        raise ValueError(f"strategy must be 'recursive' or 'direct', not {strategy!r}")
-    if band not in ("absolute", "vol_scaled", "rw"):
-        raise ValueError(f"band must be 'absolute', 'vol_scaled' or 'rw', not {band!r}")
+    y = np.asarray(log_prices, dtype=float)
+    y = y[np.isfinite(y)]
+    if len(y) < 30:
+        return {"ok": False, "note": "insufficient history for a state-space fit"}
 
-    max_obs = 750 if interval == 'daily' else 500
-    clean_df = prepare_log_returns(df, max_obs=max_obs)
+    best = {"loglik": -np.inf}
+    for ql in _Q_LEVEL_GRID:
+        for qs in _Q_SLOPE_GRID:
+            for phi in _PHI_GRID:
+                res = kalman_filter(y, ql, qs, 1.0, phi)
+                if res["loglik"] > best["loglik"]:
+                    best = {"loglik": res["loglik"], "q_level": float(ql),
+                            "q_slope": float(qs), "phi": float(phi)}
 
-    returns = clean_df['log_return'].values.astype(float)
-    prices = clean_df['adj_close'].values.astype(float)
-    n = len(returns)
-    last_price = float(prices[-1])
-    last_date = clean_df.index[-1]
-    future_dates = generate_future_dates(last_date, horizon, interval)
+    if not np.isfinite(best.get("loglik", -np.inf)):
+        return {"ok": False, "note": "likelihood did not evaluate"}
 
-    # Temporal split: proper-train block vs the recent calibration block.
-    cal_size = max(_LOOK_BACK + horizon + 5, int(round(n * cal_frac)))
-    if min_cal_origins:
-        cal_size = max(cal_size, horizon + int(min_cal_origins) - 1)
-    train_end = n - cal_size
-    calibrate = train_end > 2 * _LOOK_BACK + 20
-    if not calibrate:
-        train_end = n          # too little data: fit on all, no band
+    # Local refinement around the grid optimum: the grid is coarse on purpose
+    # (to survive the multi-modality), so a short multiplicative walk recovers
+    # the resolution the grid gave up.
+    if refine:
+        for _ in range(3):
+            improved = False
+            for factor in (0.5, 2.0):
+                for key in ("q_level", "q_slope"):
+                    cand = dict(best)
+                    cand[key] = best[key] * factor
+                    res = kalman_filter(y, cand["q_level"], cand["q_slope"],
+                                        1.0, cand["phi"])
+                    if res["loglik"] > best["loglik"] + 1e-9:
+                        best = dict(cand, loglik=res["loglik"])
+                        improved = True
+            if not improved:
+                break
 
-    arima_model = _fit_arima(returns[:train_end])
-    arima_res = arima_model.arima_res_          # statsmodels results, for fixed-parameter paths
-    residuals = _residual_history(arima_res, returns[:train_end])
+    final = kalman_filter(y, best["q_level"], best["q_slope"], 1.0,
+                          best["phi"], return_states=True)
 
-    if len(residuals) <= _LOOK_BACK + 10:
-        print("Insufficient data for LSTM residual model, using ARIMA only")
-        arima_fcast = arima_model.predict(n_periods=horizon)
-        curr_price, future_data = last_price, []
-        for i in range(horizon):
-            curr_price *= np.exp(arima_fcast[i])
-            future_data.append({'datetime': future_dates[i],
-                                'predicted_price': float(curr_price)})
-        return pd.DataFrame(future_data)
+    # Recover the absolute scale. sigma2 is exactly the factor profiled out of
+    # the likelihood - the mean squared STANDARDISED innovation - so multiplying
+    # every variance by it restores the fitted model to the data's units.
+    mult = float(final.get("sigma2", 1.0))
+    if not np.isfinite(mult) or mult <= _EPS:
+        mult = 1.0
 
-    if not lstm:
-        def paths(preds, hists, lasts):
-            return np.asarray(lasts, dtype=float)[:, None] * np.exp(
-                np.cumsum(np.atleast_2d(preds), axis=1))
-    elif strategy == "direct" and len(residuals) - _LOOK_BACK - horizon + 1 >= 40:
-        X_res, y_res, resid_scaler, scale = _build_direct_sequences(residuals, horizon)
-        lstm_model = _train_residual_lstm(X_res, y_res, output_dim=horizon)
+    return {
+        "ok": True,
+        "q_level": best["q_level"] * mult,
+        "q_slope": best["q_slope"] * mult,
+        "r": 1.0 * mult,
+        "phi": best["phi"],
+        "loglik": best["loglik"],
+        "level": final["level"],
+        "slope": final["slope"],
+        "P": final["P"] * mult,
+        "n_obs": int(len(y)),
+        "degenerate_to_random_walk": bool(
+            best["q_slope"] <= 1e-6 or best["phi"] <= 1e-9),
+    }
 
-        def paths(preds, hists, lasts):
-            return _direct_paths(preds, hists, lasts, lstm_model, resid_scaler, scale)
-    else:
-        if strategy == "direct":
-            print("Too little history for the direct strategy; using the recursive one")
-        X_res, y_res, resid_scaler = _build_residual_sequences(residuals)
-        lstm_model = _train_residual_lstm(X_res, y_res)
 
-        def paths(preds, hists, lasts):
-            return _hybrid_paths(preds, hists, lasts, lstm_model, resid_scaler)
+# ==========================================
+# 3. Forecasting
+# ==========================================
+def forecast_kalman(fit, horizon):
+    """
+    h-step-ahead means and variances from a fitted state.
 
-    half = [None] * horizon
-    if calibrate:
-        origins = list(range(train_end, n - horizon + 1))
-        if len(origins) > max_cal_origins:
-            stride = int(np.ceil(len(origins) / max_cal_origins))
-            origins = origins[::stride]
-        print(f"Calibrating the hybrid's 95% band on {len(origins)} recent origins...")
-        preds, hists = [], []
-        for t in origins:
-            # The forecast made after observing return t-1 targets prices t..t+h-1.
-            cond = _conditioned(arima_res, returns[train_end:t])
-            preds.append(np.asarray(cond.forecast(horizon), dtype=float))
-            hists.append(_residual_history(cond, returns[:t]))
-        cal_paths = paths(np.vstack(preds), hists, prices[np.array(origins) - 1])
-        actual = np.stack([prices[t:t + horizon] for t in origins])
-        errors = np.abs(np.log(actual / cal_paths))
-        if band == "vol_scaled":
-            root = np.sqrt(np.arange(1, horizon + 1))
-            sd_o = np.array([_vol_at(returns, t) for t in origins])
-            errors = errors / (sd_o[:, None] * root[None, :])
+    The damped trend contributes ``slope * sum(phi^i for i in 1..h)`` — a
+    geometric sum, so the extrapolation converges rather than running away. The
+    forecast variance grows with horizon through the accumulated state noise,
+    which is what makes the cone widen without any conformal step.
+
+    Returns
+    -------
+    (mean, var) : tuple of numpy arrays, both length ``horizon``, in log-price
+    units.
+    """
+    if not fit.get("ok"):
+        return np.array([]), np.array([])
+
+    level, slope = fit["level"], fit["slope"]
+    phi, ql, qs, r = fit["phi"], fit["q_level"], fit["q_slope"], fit["r"]
+    p11, p12, p22 = fit["P"][0, 0], fit["P"][0, 1], fit["P"][1, 1]
+
+    means = np.empty(horizon)
+    variances = np.empty(horizon)
+    lvl, slp = level, slope
+    for h in range(horizon):
+        # Propagate the state one step, exactly as the filter's predict step.
+        lvl_next = lvl + phi * slp
+        slp_next = phi * slp
+        p11_n = p11 + 2.0 * phi * p12 + phi * phi * p22 + ql
+        p12_n = phi * p12 + phi * phi * p22
+        p22_n = phi * phi * p22 + qs
+
+        lvl, slp = lvl_next, slp_next
+        p11, p12, p22 = p11_n, p12_n, p22_n
+        means[h] = lvl
+        variances[h] = p11 + r        # observation variance, not just state
+    return means, variances
+
+
+# ==========================================
+# 4. Project-facing entry point
+# ==========================================
+#: The configuration before section 115, which every run keeps unless a switch
+#: is given: the static 95% quantile of the one-step residuals, times sqrt(h).
+KALMAN_LEGACY = dict(aci=False, hstep=False)
+
+
+def resolve_switches(interval, horizon, aci=None, hstep=None):
+    """
+    The switches a run uses. A switch left as None takes KALMAN_LEGACY's value;
+    an explicit value is kept. ``interval`` and ``horizon`` are taken so a
+    horizon-dependent default can be added without changing callers.
+    """
+    given = dict(aci=aci, hstep=hstep)
+    return {k: KALMAN_LEGACY[k] if v is None else bool(v) for k, v in given.items()}
+
+
+def hstep_errors(log_px, levels, slopes, fit_end, phi, horizon):
+    """
+    The h-step errors on the calibration tail, h = 1..horizon: from the
+    filtered state at each origin t >= fit_end - 1, the forecast
+    ``level_t + slope_t * (phi + ... + phi^h)`` against ``log_px[t + h]``. At
+    h = 1 these are exactly the one-step innovations of the tail.
+    """
+    n = len(log_px)
+    out = []
+    for h in range(1, horizon + 1):
+        s_h = float(sum(phi ** i for i in range(1, h + 1)))
+        t = np.arange(fit_end - 1, n - h)
+        e = log_px[t + h] - (levels[t] + slopes[t] * s_h) if len(t) else np.array([])
+        out.append(e[np.isfinite(e)])
+    return out
+
+
+def _halfwidths(resid, errors, horizon, aci, hstep, min_n=20):
+    """Conformal half-widths per step (README section 115).
+
+    Static (shipped): the 95% quantile of |one-step residual| times sqrt(h).
+    ``aci``: that quantile's level adapted along the residual stream (Gibbs and
+    Candes, Adaptive Conformal Inference, 2021; ``model_utils.aci_quantile``).
+    ``hstep``: step h takes the quantile of its own h-step errors (calibration
+    per horizon, as Stankeviciute, Alaa and van der Schaar 2021), falling back
+    to the one-step rule when fewer than ``min_n`` are available."""
+    from model_utils import aci_quantile
+
+    def q(x):
+        x = np.abs(np.asarray(x, dtype=float))
+        return float(aci_quantile(x)) if aci else float(np.quantile(x, 0.95))
+
+    q1 = q(resid)
+    half = np.array([q1 * np.sqrt(h + 1) for h in range(horizon)])
+    if hstep:
         for h in range(horizon):
-            r = errors[:, h]
-            m = len(r)
-            if m:
-                q_level = min(1.0, np.ceil((m + 1) * (1 - alpha)) / m)
-                half[h] = float(np.quantile(r, q_level))
+            if len(errors[h]) >= min_n:
+                half[h] = q(errors[h])
+    return half
 
-    print(f"Generating {horizon} hybrid (ARIMA+LSTM) forecasts...")
-    live = _conditioned(arima_res, returns[train_end:])
-    point = paths(np.asarray(live.forecast(horizon), dtype=float)[None, :],
-                  [_residual_history(live, returns)], [last_price])[0]
-    if band == "vol_scaled" and calibrate:
-        sd_now = _vol_at(returns, n)
-        half = [None if q is None else q * sd_now * np.sqrt(i + 1) for i, q in enumerate(half)]
-    elif band == "rw":
-        sd_now = _vol_at(returns, n)
-        half = [1.959963984540054 * sd_now * np.sqrt(i + 1) for i in range(horizon)]
 
-    rows = []
-    for i in range(horizon):
-        p, q = float(point[i]), half[i]
-        if q is None:
-            rows.append({'datetime': future_dates[i], 'predicted_price': p})
+def kalman_paths(df, interval, horizon, use_conformal=True, variants=((False, False),)):
+    """
+    Forecast paths for several (aci, hstep) settings from one fit:
+    {(aci, hstep): DataFrame}. The switches change only the band; the fit and
+    the centre are the same for every setting.
+    """
+    from model_utils import normalize_interval, generate_future_dates
+
+    interval = normalize_interval(interval)
+    variants = tuple((bool(a), bool(b)) for a, b in variants)
+
+    work = df.copy()
+    price_col = next((c for c in ("adj_close", "close", "price")
+                      if c in work.columns), None)
+    if price_col is None:
+        raise ValueError("no price column found for the Kalman model")
+
+    prices = pd.to_numeric(work[price_col], errors="coerce").dropna().values
+    if len(prices) < 60:
+        raise ValueError("insufficient history for the Kalman model")
+
+    max_obs = 1000 if interval == "daily" else 750
+    if len(prices) > max_obs:
+        prices = prices[-max_obs:]
+        work = work.tail(max_obs)
+
+    log_px = np.log(np.maximum(prices, _EPS))
+
+    # Fit on all but a calibration tail, so the conformal residuals are genuinely
+    # out-of-sample with respect to the parameter estimates.
+    cal_n = max(20, int(0.2 * len(log_px)))
+    fit_end = len(log_px) - cal_n
+    fit = fit_kalman(log_px[:fit_end])
+    if not fit.get("ok"):
+        raise ValueError(fit.get("note", "Kalman fit failed"))
+
+    # One-step conformal residuals on the held-out tail, produced by running the
+    # SAME fitted parameters forward — never refitting on the calibration block.
+    cal_res = kalman_filter(log_px, fit["q_level"], fit["q_slope"], fit["r"],
+                            fit["phi"], return_states=True)
+    resid = cal_res["innovations"][fit_end:]
+    resid = resid[np.isfinite(resid)]
+    errors = None
+    if any(b for _, b in variants):
+        errors = hstep_errors(log_px, cal_res["levels"], cal_res["slopes"],
+                              fit_end, fit["phi"], horizon)
+
+    full = fit_kalman(log_px)
+    if not full.get("ok"):
+        full = fit
+    means, variances = forecast_kalman(full, horizon)
+    native_sd = np.sqrt(np.maximum(variances, _EPS))
+
+    last_price = float(prices[-1])
+    last_date = work["datetime"].iloc[-1] if "datetime" in work.columns else None
+    future = generate_future_dates(last_date, horizon, interval)
+
+    outs = {}
+    for aci, hstep in variants:
+        # Conformal half-width per step. One-step residuals scaled by sqrt(h) is
+        # the standard random-walk widening; it makes no Gaussian claim, only
+        # that the residual distribution is stationary over the calibration block.
+        if use_conformal and len(resid) >= 20:
+            half = _halfwidths(resid, errors, horizon, aci, hstep)
+            band_mode = "conformal" + ("+aci" if aci else "") + ("+hstep" if hstep else "")
         else:
-            lower, upper = float(p * np.exp(-q)), float(p * np.exp(q))
-            rows.append({'datetime': future_dates[i], 'predicted_price': p,
-                         'lower_bound': lower, 'upper_bound': upper,
-                         'volatility': float((upper - lower) / (2 * 1.96))})
+            half = _Z95 * native_sd
+            band_mode = "native-gaussian"
 
-    print("Hybrid ARIMA+LSTM Prediction Complete.")
-    return pd.DataFrame(rows)
+        rows = []
+        for h in range(horizon):
+            centre = float(np.exp(means[h]))
+            rows.append({
+                "datetime": future[h],
+                "predicted_price": centre,
+                "lower_bound": float(np.exp(means[h] - half[h])),
+                "upper_bound": float(np.exp(means[h] + half[h])),
+                "volatility": float(centre * native_sd[h]),
+            })
+        out = pd.DataFrame(rows)
+
+        out.attrs["kalman"] = {
+            "q_level": full["q_level"], "q_slope": full["q_slope"],
+            "r": full["r"], "phi": full["phi"], "loglik": full["loglik"],
+            "slope": full["slope"], "n_obs": full["n_obs"],
+            "degenerate_to_random_walk": full["degenerate_to_random_walk"],
+            "band_mode": band_mode,
+            "native_halfwidth": [float(v) for v in (_Z95 * native_sd)],
+            "used_halfwidth": [float(v) for v in half],
+            "n_calibration": int(len(resid)),
+        }
+        outs[(aci, hstep)] = out
+    if full["degenerate_to_random_walk"]:
+        print("Kalman: fitted slope variance ~ 0 - the series prefers a LOCAL "
+              "LEVEL (random-walk) model, so the forecast is flat by choice.")
+    return outs, full
+
+
+def run_kalman_prediction(df, interval, horizon, use_conformal=True, aci=None,
+                          hstep=None):
+    """
+    Forecast with a damped local linear trend, returning the project's schema.
+
+    Parameters
+    ----------
+    use_conformal : bool
+        When True (default) the interval half-widths are **conformalised** on
+        held-out one-step residuals, exactly like every other model here, and
+        the Kalman-native Gaussian width is reported alongside in ``attrs`` for
+        comparison. When False the native width is used directly.
+
+        Default True on purpose. The native interval is the book's selling point
+        and it is genuinely elegant, but it is only as good as its Gaussian
+        assumption, and this project has measured repeatedly that equity
+        residuals are fat-tailed. Shipping the assumption-light version and
+        *reporting* the assumption-heavy one is the honest arrangement;
+        ``run_kalman_eval.py`` measures which is better calibrated.
+    aci, hstep : bool or None
+        None (default) takes KALMAN_LEGACY (README section 115). ``aci``: the
+        residual quantile's level adapts along the calibration stream
+        (adaptive conformal inference). ``hstep``: each step's half-width is the
+        quantile of the tail's own h-step errors rather than the one-step
+        quantile times sqrt(h). Both apply only to the conformal band.
+    """
+    from model_utils import normalize_interval
+
+    interval = normalize_interval(interval)
+    print(f"--- Starting Kalman (local trend) Prediction ({interval}) ---")
+    sw = resolve_switches(interval, horizon, aci, hstep)
+    v = (sw["aci"], sw["hstep"])
+    outs, full = kalman_paths(df, interval, horizon, use_conformal, variants=(v,))
+    out = outs[v]
+    print(f"Kalman fit (phi={full['phi']:.2f}, q_level={full['q_level']:.2e}, "
+          f"q_slope={full['q_slope']:.2e}); band={out.attrs['kalman']['band_mode']}")
+    print("Kalman Prediction Complete.")
+    return out
 ```
