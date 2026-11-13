@@ -9,136 +9,279 @@
   
 ```
 """
-The forward record, run from the app instead of from scheduled tasks.
+Pure serving-gate logic — the layer the product's *trust* depends on.
 
-README sections 77 and 78 left two routines to Windows scheduled tasks: score
-the forecasts that have matured (``run_monitor.bat``) and forecast the frozen
-watchlist once a week (``run_watchlist.bat``). The owner chose not to set
-those up, so the app does it (README section 82):
+A reviewer's point: "your product's trust depends on the gates, not only the
+models." So the gate rules live here, free of Streamlit, and are unit-tested
+directly (``test_gates.py``). The UI imports these; it does not re-implement them.
 
-* ``record_status`` says what the record holds and whether this week's
-  watchlist forecast is due (none yet, or the last one is 7 or more days old).
-* ``score_matured`` fills in the outcomes that have arrived. It is idempotent
-  and quick, so the app runs it once a day when it opens.
-* ``launch_watchlist`` starts ``run_watchlist.py`` as its own process, with its
-  output in ``.prediction_log/watchlist_runs/``, so the app stays usable and
-  the run carries on if the browser tab is closed. It refuses to start a second
-  run while one is alive; ``run_watchlist.py`` also skips any company already
-  logged for the same origin, so even a double start cannot log a forecast twice.
+The rules encode the project's honest-serving contract:
+* a "No edge" confidence bucket withholds the directional call,
+* degraded / event-risk data forces every model to "No edge" (cone-only),
+* an **off-manifold market regime** (autoencoder novelty) does the same, because
+  a backtest-derived confidence bucket is an extrapolation once the present
+  state is unlike anything the models were fitted on,
+* conviction is the move measured in units of the model's own uncertainty, so a
+  wide interval mechanically yields |conviction| < 1 ("inside the band").
 
-Nothing here is scheduled or left behind after the run: one click, one process.
+The bucket rule itself lives in ``backtest.confidence_bucket`` (shared with the
+offline calibration harness); this module is the *serving* layer on top of it.
 """
 
-import json
-import os
-import subprocess
-import sys
+import numpy as np
 
-import pandas as pd
+from backtest import null_probability_floor
 
-import prediction_log as pl
-
-ROOT = os.path.dirname(os.path.abspath(__file__))
-RUN_DIR = os.path.join(pl.LOG_DIR, "watchlist_runs")
-RUN_FILE = os.path.join(RUN_DIR, "current.json")
-DUE_AFTER_DAYS = 7
+WITHHELD_BUCKET = "No edge"
+WITHHELD_DIRECTION = "–"
 
 
-def record_status(log_df=None, now=None):
-    """What the forward record holds, and whether the watchlist is due."""
-    df = pl.read_log() if log_df is None else log_df
-    now = pd.Timestamp.now() if now is None else pd.Timestamp(now)
-    resolved = df["realised_price"].notna() if len(df) else pd.Series(dtype=bool)
-    wl = df[df["source"] == "watchlist"] if len(df) else df
-    last = None
-    if len(wl):
-        last = pd.to_datetime(wl["logged_at_utc"], utc=True, errors="coerce").max()
-        last = None if pd.isna(last) else last.tz_localize(None)
-    days = None if last is None else (now - last).days
-    return {
-        "rows": int(len(df)),
-        "resolved": int(resolved.sum()),
-        "pending": int((~resolved).sum()),
-        "watchlist_rows": int(len(wl)),
-        "last_watchlist": last,
-        "days_since_watchlist": days,
-        "watchlist_due": days is None or days >= DUE_AFTER_DAYS,
-    }
-
-
-def score_matured(verbose=False):
-    """Fill in matured outcomes through the same fetch the monitor uses."""
-    from get_data import get_whole_stock_data
-    from safe_fetch import fetch_with_fallback
-
-    def _fetch(ticker, interval):
-        return fetch_with_fallback(ticker, interval, fetch_fn=get_whole_stock_data)
-
-    return pl.resolve_outcomes(_fetch, verbose=verbose)
-
-
-def _alive(pid):
-    """True while process ``pid`` is running (never signals it)."""
-    try:
-        import psutil
-        return psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
-    except ImportError:
-        pass
-    except Exception:
-        return False
-    if os.name == "nt":
-        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                             capture_output=True, text=True).stdout
-        return str(pid) in out
-    try:
-        os.kill(pid, 0)   # POSIX only: signal 0 checks without signalling
-        return True
-    except OSError:
-        return False
-
-
-def current_run(run_file=RUN_FILE):
-    """The watchlist run in progress, as {'pid', 'started', 'log'}, or None."""
-    try:
-        with open(run_file, encoding="utf-8") as f:
-            run = json.load(f)
-    except (OSError, ValueError):
-        return None
-    return run if _alive(int(run.get("pid", -1))) else None
-
-
-def launch_watchlist(run_file=RUN_FILE, popen=subprocess.Popen, now=None):
+def gated_direction(change, bucket):
     """
-    Start ``run_watchlist.py`` in its own process and return its run record.
+    Resolve (sentiment, direction) for a model row, honouring the gate.
 
-    Returns the run already in progress instead if there is one.
+    When the confidence ``bucket`` is "No edge" the directional call is withheld
+    — the app never asserts Bullish/Bearish on a forecast its own walk-forward
+    test rates no better than a coin flip.
+
+    Parameters
+    ----------
+    change : float
+        Forecast price change (sign gives Bullish/Bearish when not withheld).
+    bucket : str
+        Confidence bucket ('High'/'Medium'/'Low'/'No edge'/...).
+
+    Returns
+    -------
+    tuple(str, str)
+        (sentiment, direction marker).
     """
-    run = current_run(run_file)
-    if run:
-        return dict(run, already_running=True)
-    now = pd.Timestamp.now() if now is None else pd.Timestamp(now)
-    os.makedirs(os.path.dirname(run_file), exist_ok=True)
-    log = os.path.join(os.path.dirname(run_file), f"watchlist_{now:%Y%m%d_%H%M}.log")
-    flags = 0
-    if os.name == "nt":
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-    env = dict(os.environ, STOCKAPP_QUIET="1", PYTHONUNBUFFERED="1")
-    with open(log, "w", encoding="utf-8") as out:
-        proc = popen([sys.executable, os.path.join(ROOT, "run_watchlist.py")],
-                     cwd=ROOT, stdout=out, stderr=subprocess.STDOUT,
-                     stdin=subprocess.DEVNULL, env=env, creationflags=flags)
-    run = {"pid": proc.pid, "started": now.isoformat(timespec="minutes"), "log": log}
-    with open(run_file, "w", encoding="utf-8") as f:
-        json.dump(run, f)
-    return dict(run, already_running=False)
+    if bucket == WITHHELD_BUCKET:
+        return WITHHELD_BUCKET, WITHHELD_DIRECTION
+    if change >= 0:
+        return "Bullish", "▲"
+    return "Bearish", "▼"
 
 
-def last_lines(path, n=3):
-    """The last ``n`` non-empty lines of a run's log (progress for the sidebar)."""
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            lines = [ln.rstrip() for ln in f if ln.strip()]
-    except OSError:
-        return []
-    return lines[-n:]
+def conviction(change, lower, upper):
+    """
+    Forecast move ÷ half the model's own 95% interval width.
+
+    Same sign as the move; |conviction| >= 1 means the move exceeds the model's
+    uncertainty (the current price sits outside the band). A *wide* interval
+    therefore drives conviction toward 0 — the band swamps the move — which is
+    exactly the "don't over-read a noisy point" behaviour the gate wants.
+
+    Returns
+    -------
+    float
+        Conviction, or ``np.nan`` if no usable interval is available.
+    """
+    if lower is None or upper is None:
+        return float("nan")
+    half_band = (float(upper) - float(lower)) / 2.0
+    if half_band <= 0:
+        return float("nan")
+    return float(change) / half_band
+
+
+def _withhold(entry, note):
+    """
+    Force ``entry`` to "No edge" and record why, unless a gate already withheld it.
+
+    The UI's confidence entries always carry a ``note`` key (``''`` when the
+    assessment had nothing to say), so ``setdefault`` would never write the
+    reason, and ``confidence_reason`` would then report "no edge vs random walk"
+    for a row that was really withheld for its data or regime. The first gate to
+    withhold keeps its reason; an empty or assessment note is replaced.
+    """
+    entry["bucket"] = WITHHELD_BUCKET
+    if not str(entry.get("note") or "").startswith("withheld"):
+        entry["note"] = note
+
+
+def apply_data_quality_gate(conf_map, model_names, degraded):
+    """
+    On degraded/event-risk data, force every model's bucket to "No edge".
+
+    This reuses the existing abstention machinery (``gated_direction`` keys off
+    "No edge") so directional calls vanish consistently when the *input* — not
+    the model — is the problem. Returns a NEW dict; inputs are not mutated.
+
+    Parameters
+    ----------
+    conf_map : dict
+        Mapping model name -> confidence dict (may be empty if assessment off).
+    model_names : iterable of str
+        Models in the current run.
+    degraded : bool
+        True when the data-quality gate is in 'risk_cone_only' or 'abstain'.
+
+    Returns
+    -------
+    dict
+        Updated confidence map.
+    """
+    out = {k: dict(v) for k, v in (conf_map or {}).items()}
+    if not degraded:
+        return out
+    for name in model_names:
+        entry = dict(out.get(name, {}))
+        _withhold(entry, "withheld: data quality")
+        out[name] = entry
+    return out
+
+
+def apply_novelty_gate(conf_map, model_names, novelty):
+    """
+    On an **off-manifold market regime**, force every model's bucket to "No edge".
+
+    Closes a blind spot in the existing gates. ``apply_data_quality_gate`` catches
+    a broken *input*; the confidence bucket catches a model with no measured edge
+    *in the past*. Neither can see that the present regime is unlike anything the
+    models were fitted on — and in that situation a backtest-derived confidence
+    bucket is an extrapolation, not evidence. The autoencoder novelty detector
+    (``autoencoder_regime.regime_novelty``) supplies the missing signal.
+
+    Deliberately conservative: only an ``'unprecedented'`` verdict (reconstruction
+    error above the 99.5th percentile of the held-out reference distribution)
+    withholds the call. An ``'unusual'`` verdict is *annotated* but left tradeable,
+    because equity data is fat-tailed and a 95th-percentile window is a normal
+    monthly occurrence — gating on it would abstain far too often to be useful.
+
+    Reuses the same "No edge" mechanism as the other gates so the directional
+    call disappears consistently, whatever the reason. Returns a NEW dict; inputs
+    are not mutated.
+
+    Parameters
+    ----------
+    conf_map : dict
+        Mapping model name -> confidence dict.
+    model_names : iterable of str
+        Models in the current run.
+    novelty : dict
+        Report from ``autoencoder_regime.regime_novelty``. An unavailable or
+        ``'unknown'`` report is a no-op, so the gate never fires on a failed
+        novelty check.
+
+    Returns
+    -------
+    dict
+        Updated confidence map.
+    """
+    out = {k: dict(v) for k, v in (conf_map or {}).items()}
+    if not novelty or not novelty.get("available"):
+        return out
+
+    verdict = novelty.get("verdict")
+    if verdict not in ("unusual", "unprecedented"):
+        return out
+
+    pct = novelty.get("percentile", float("nan"))
+    pct_s = f"{pct * 100:.1f}th pct" if pct == pct else "n/a"     # NaN check
+    for name in model_names:
+        entry = dict(out.get(name, {}))
+        entry["novelty"] = verdict
+        if verdict == "unprecedented":
+            _withhold(entry, f"withheld: unseen market regime ({pct_s})")
+        elif not entry.get("note"):
+            entry["note"] = f"caution: unusual market regime ({pct_s})"
+        out[name] = entry
+    return out
+
+
+#: The longest daily horizon (sessions) with a directional call. Every skill
+#: measurement in this project is at about five sessions; beyond two weeks the
+#: median path is a guess and the 95% range is the forecast (README section 83).
+MAX_DIRECTIONAL_SESSIONS = 13
+
+#: Models whose 95% band held under 90% of outcomes at 20-90 sessions on NSE
+#: data before the reserved period (run_long_horizon_coverage.py, the rule
+#: written down before the run). They are left out of daily runs longer than
+#: MAX_DIRECTIONAL_SESSIONS, where the range is the forecast (README section 83).
+#: Regime Switching was on it until its range was fixed to use its own fit; it
+#: then held 98.4% at 20-90 sessions (run_regime_fix.py, README section 88).
+#: LightGBM came off when larger leaves and a shrunk centre held 94.4% on a
+#: fresh draw (run_lgbm_band.py, README section 97). Prophet came off when a
+#: flat trend with its change shrunk toward no change held 96.9% on a fresh
+#: draw (run_prophet_improve.py, README section 116).
+LONG_HORIZON_EXCLUDED = ("Hybrid ARIMA+LSTM",)
+
+
+def long_horizon_models(model_names, horizon, interval="1d",
+                        max_sessions=MAX_DIRECTIONAL_SESSIONS, excluded=LONG_HORIZON_EXCLUDED):
+    """``(kept, left_out)``: the models to run at this horizon, and the ones dropped.
+
+    Only daily horizons beyond ``max_sessions`` drop anything; order is kept.
+    """
+    names = list(model_names)
+    if str(interval).lower() not in ("1d", "daily", "1 day") or int(horizon) <= max_sessions:
+        return names, []
+    return ([m for m in names if m not in excluded], [m for m in names if m in excluded])
+
+
+def apply_horizon_gate(conf_map, model_names, horizon, interval="1d",
+                       max_sessions=MAX_DIRECTIONAL_SESSIONS):
+    """
+    Beyond ``max_sessions`` daily sessions, force every model's bucket to "No edge".
+
+    Same "No edge" mechanism as the other gates, so the directional call goes
+    away whatever the reason, and the range is what the page presents. Hourly
+    horizons are capped at five sessions by the selector and are left alone.
+    Returns a NEW dict; inputs are not mutated.
+    """
+    out = {k: dict(v) for k, v in (conf_map or {}).items()}
+    if str(interval).lower() not in ("1d", "daily", "1 day") or int(horizon) <= max_sessions:
+        return out
+    for name in model_names:
+        entry = dict(out.get(name, {}))
+        _withhold(entry, f"withheld: long horizon ({int(horizon)} sessions; the range is the forecast)")
+        out[name] = entry
+    return out
+
+
+def confidence_reason(entry):
+    """
+    Short, auditable reason code for a model's confidence verdict.
+
+    Ties the bucket to the DM p-value / coverage / data-quality so every row says
+    *why* it got its label instead of presenting a bare bucket (or an implied
+    winner). Reads a conf_map entry produced by the UI's confidence assessment.
+    """
+    if not entry:
+        return "not assessed"
+    note = entry.get("note", "")
+    if "data quality" in note:
+        return "withheld — data quality"
+    if "unseen market regime" in note:
+        return "withheld — unseen market regime"
+    if "long horizon" in note:
+        return "withheld — long horizon: the range is the forecast"
+    bucket = entry.get("bucket", "—")
+    dm_p = entry.get("dm_p", float("nan"))
+    cov = entry.get("coverage", float("nan"))
+    imp = entry.get("improvement", float("nan"))
+    p = f"DM p={dm_p:.2f}" if dm_p == dm_p else "DM n/a"        # NaN check
+    cov_s = f", cov {cov*100:.0f}%" if cov == cov else ""
+    imp_s = f"{imp*100:+.0f}% vs RW" if imp == imp else ""
+    # An 'unusual' (but not unprecedented) regime does not withhold the call; it
+    # is surfaced as a caveat on whatever verdict the skill test produced.
+    suffix = " · unusual regime" if entry.get("novelty") == "unusual" else ""
+    # A p-value is not the probability of no edge. Where the label claims an
+    # edge, print the least that probability can be (backtest.null_probability_floor),
+    # so "DM p=0.08" cannot be read as "92% sure".
+    floor = null_probability_floor(dm_p) if dm_p == dm_p else float("nan")
+    floor_s = f"; P(no edge) ≥ {floor*100:.0f}%" if floor == floor else ""
+
+    if bucket == "High":
+        return f"beats random walk ({p}{cov_s}{floor_s}){suffix}"
+    if bucket == "Medium":
+        return f"weak edge ({p}{floor_s}){suffix}"
+    if bucket == "Low":
+        return f"within noise ({imp_s}, {p}){suffix}"
+    if bucket == WITHHELD_BUCKET:
+        return f"no edge vs random walk ({p})"
+    if bucket == "N/A":
+        return note or "assessment failed"
+    return "—"
 ```
